@@ -1,0 +1,17 @@
+# Local credentials -- never commit
+.env
+.env.local
+.env.*.local
+
+# Local Python venv (created by batch-onboard.sh)
+.venv/
+
+# Local state -- per-deployment, not shared
+onboarded.json
+onboarded.json.tmp
+.last-batch.json
+
+# Caches
+__pycache__/
+*.pyc
+*.pyo
