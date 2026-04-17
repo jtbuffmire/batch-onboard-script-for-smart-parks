@@ -66,5 +66,12 @@ EOF
   touch "${VENV_DIR}/.bluetooth-hint-shown"
 fi
 
-# 5. run
-exec python3 "${PY_SCRIPT}" "$@"
+# 5. Prevent macOS idle sleep during the run (caffeinate -i keeps the CPU/
+#    process alive without requiring AC power; display may still dim/sleep).
+#    On Linux this is a no-op. The -i flag prevents idle sleep only; use -s
+#    to also prevent sleep on battery if you need that.
+if [ "$(uname -s)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
+  exec caffeinate -i python3 "${PY_SCRIPT}" "$@"
+else
+  exec python3 "${PY_SCRIPT}" "$@"
+fi
