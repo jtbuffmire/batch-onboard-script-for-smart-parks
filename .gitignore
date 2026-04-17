@@ -11,6 +11,9 @@ onboarded.json
 onboarded.json.tmp
 .last-batch.json
 
+# Generated device reports (per-deployment audit artifacts)
+reports/
+
 # Caches
 __pycache__/
 *.pyc

@@ -28,6 +28,15 @@ launches the interactive wizard. The wizard asks:
    [configure.buoy.fish](https://configure.buoy.fish)).
 4. **Force re-visit?** — whether to re-onboard devices that are already
    activated on ChirpStack or already in the local ledger. Default no.
+5. **GPS home (optional)** — decimal `lat,lon` of your deployment area.
+   Written to `gps_init_lat`/`gps_init_lon` to speed up first GPS fix
+   on the device. Press Enter to skip. Use your **deployment** location,
+   not the configuration location, when the device is being shipped to
+   another region.
+
+Every device the script touches also gets its `init_time` set to the
+host's current UTC time (free fix for the stale 2021 timestamps that
+factory-fresh devices ship with). Disable with `--no-set-time`.
 
 After answering 2–4, the wizard offers to save them to
 `./.last-batch.json`. **On subsequent runs**, if both `.env` and
@@ -179,6 +188,9 @@ when any non-trivial flag is present.
 | `--idle-windows N` | Exit after N consecutive empty scan windows (default 3). |
 | `--reboot` / `--rejoin` / `--no-rejoin` | Override the post-action. Default is `--reboot`. `--rejoin` is diagnostic-only and almost never works (the firmware silently drops cmd_join). |
 | `--per-device-timeout N` | Hard cap on per-device BLE work in seconds (default 45). Raise for slow devices or congested BLE environments. |
+| `--no-set-time` | Don't write the device's `init_time`. Default is to set it to host UTC on every visit. |
+| `--home-lat DEG`, `--home-lon DEG` | Set `gps_init_lat`/`gps_init_lon` (deployment area, not config location) for faster first GPS fix. Both must be supplied. |
+| `--report` | Read-only audit mode. See "Report mode" below. |
 | `--verify-wait-min N` | Minutes to wait before checking ChirpStack (default 10). |
 | `--no-verify` | Skip the ChirpStack post-flight check (and the pre-flight snapshot). |
 | `--lns-env PATH` | Use credentials from a different `.env` file. |
@@ -209,6 +221,37 @@ when any non-trivial flag is present.
 
 By default the script skips devices already in the ledger (in addition
 to skipping LNS-active devices). `--force` bypasses both.
+
+## Report mode (read-only QA snapshot)
+
+```bash
+./batch-onboard.sh --report
+```
+
+Walks every IRNAS device in BLE range, reads its full settings dump,
+queries ChirpStack for activation status, and writes:
+
+- One Markdown file per device under `./reports/{SP#}_{DevEUI}_{ts}.md`
+  — human-readable, includes LoRaWAN config, GPS profile, last-known
+  position, and a complete table of every setting on the device.
+- One combined JSONL file at `./reports/device-reports-{ts}.jsonl`
+  — one line per device, machine-readable for grep/diff/import.
+
+**Does NOT write or reboot anything.** Safe to run before deployment,
+during QA acceptance, or any time you want a baseline snapshot to diff
+against later.
+
+The report uses an optional setting-name schema if it can find one
+(searches a few candidate paths next to the script, including the
+`prod/configure-buoy-fish/settings/settings_v7.0.0.json` from the
+buoy-fish-tech monorepo). Without a schema, the report still works
+but shows `unknown_0xXX` for unrecognized setting IDs. To get fully
+decoded reports in a standalone install, copy
+[settings_v7.0.0.json](https://github.com/SmartParksOrg/ble-settings-app)
+next to the script.
+
+Sensitive settings (`app_key`, `lp0_app_key`, etc.) are always
+redacted in both the Markdown and JSONL output.
 
 ## Standalone status check
 

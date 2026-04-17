@@ -109,11 +109,17 @@ PORT_SETTINGS = 0x03
 PORT_COMMANDS = 0x20
 
 CMD_GET_SETTING = 0xA8
+CMD_SEND_ALL_SETTINGS = 0xA7  # device dumps every setting it knows
 CMD_JOIN = 0xA0   # trigger LoRa rejoin (re-init stack with current config)
 CMD_RESET = 0xA1  # full device reboot -- the only reliable way to force a real JR
+CMD_CONFIRM_PORT = 0x1F       # device replies on this port to confirm a command
 
 SETTING_LR_REGION = 0x0F
 SETTING_DEVICE_EUI = 0x11
+SETTING_INIT_TIME = 0x07
+SETTING_GPS_INIT_LON = 0x05
+SETTING_GPS_INIT_LAT = 0x06
+COORD_SCALE = 10_000_000  # IRNAS firmware stores lat/lon as int32 * 1e7
 
 # Semtech modem region enum (smtc_modem_region_t). NOT the LoRaMac-node enum.
 # Source of truth: .cursor/rules/irnas-lorawan-regions.mdc
@@ -179,12 +185,26 @@ def _u32(v: int) -> bytes:
     return int(v).to_bytes(4, "little", signed=False)
 
 
+def _i32(v: int) -> bytes:
+    return int(v).to_bytes(4, "little", signed=True)
+
+
 def _u8(v: int) -> bytes:
     return int(v).to_bytes(1, "little", signed=False)
 
 
 def _bool(v: bool) -> bytes:
     return b"\x01" if v else b"\x00"
+
+
+def coord_to_int(degrees: float) -> int:
+    """Convert decimal degrees to the int32 representation IRNAS uses (deg * 1e7)."""
+    return int(round(degrees * COORD_SCALE))
+
+
+def int_to_coord(scaled: int) -> float:
+    """Inverse of coord_to_int; for display."""
+    return scaled / COORD_SCALE
 
 
 def _profile_steps(profile: dict) -> list[tuple[str, int, bytes]]:
@@ -410,6 +430,59 @@ class DeviceSession:
         await asyncio.sleep(INTER_SETTING_WRITE_SEC)
         return True
 
+    async def write_init_time(self, when: Optional[int] = None) -> int:
+        """
+        Write the device's init_time to `when` (Unix epoch seconds, defaults to now).
+        Always writes -- the device's clock should match host time, even by 1s.
+        Returns the timestamp written.
+        """
+        ts = int(when if when is not None else time.time())
+        await self._write(frame_set_setting(SETTING_INIT_TIME, _u32(ts)))
+        await asyncio.sleep(INTER_SETTING_WRITE_SEC)
+        return ts
+
+    async def write_gps_home(self, lat_deg: float, lon_deg: float) -> tuple[bool, bool]:
+        """
+        Write gps_init_lat / gps_init_lon if either differs from the target.
+        Returns (lat_written, lon_written).
+        """
+        lat_bytes = _i32(coord_to_int(lat_deg))
+        lon_bytes = _i32(coord_to_int(lon_deg))
+        lat_written = await self.write_setting_if_different(
+            "gps_init_lat", SETTING_GPS_INIT_LAT, lat_bytes
+        )
+        lon_written = await self.write_setting_if_different(
+            "gps_init_lon", SETTING_GPS_INIT_LON, lon_bytes
+        )
+        return lat_written, lon_written
+
+    async def read_all_settings(self, timeout: float = 5.0) -> dict[int, bytes]:
+        """
+        Send cmd_send_all_settings (0xA7) and parse the bulk dump into {id: bytes}.
+        The device replies with several PORT_SETTINGS notifications followed by a
+        confirmation frame on the command-confirm port.
+        """
+        pre_len = len(self.rx_buffer)
+        await self._write(bytes([PORT_COMMANDS, CMD_SEND_ALL_SETTINGS, 0x00]))
+
+        deadline = time.monotonic() + timeout
+        confirmed = False
+        while time.monotonic() < deadline and not confirmed:
+            await asyncio.sleep(0.15)
+            for frame in self.rx_buffer[pre_len:]:
+                # Confirmation frame format: [0x1F, 0xF3, 0x02, 0xA7, 0x01]
+                if (len(frame) >= 5
+                        and frame[0] == CMD_CONFIRM_PORT
+                        and frame[3] == CMD_SEND_ALL_SETTINGS
+                        and frame[4] == 0x01):
+                    confirmed = True
+                    break
+
+        out: dict[int, bytes] = {}
+        for frame in self.rx_buffer[pre_len:]:
+            out.update(parse_settings_response(frame))
+        return out
+
     async def apply_profile_and_region(
         self, target_region: Optional[int], target_profile: Optional[dict]
     ) -> dict:
@@ -560,6 +633,26 @@ async def _onboard_one_attempt(
             print(f"  Already-correct profile settings: "
                   f"{', '.join(summary['settings_already_correct'])}")
 
+        # Always set init_time to host clock (cheap, fixes stale 2021 timestamps
+        # we observed on factory units; helps GPS cold-start).
+        init_time_written: Optional[int] = None
+        if not args.no_set_time:
+            init_time_written = await session.write_init_time()
+            print(f"  [WRITE] init_time = {init_time_written} "
+                  f"({datetime.fromtimestamp(init_time_written, timezone.utc).isoformat()})")
+
+        # Optional: set gps_init_lat/lon hint for faster GPS first-fix.
+        home_lat = getattr(args, "home_lat", None)
+        home_lon = getattr(args, "home_lon", None)
+        gps_home_written = False
+        if home_lat is not None and home_lon is not None:
+            lat_w, lon_w = await session.write_gps_home(home_lat, home_lon)
+            gps_home_written = lat_w or lon_w
+            if gps_home_written:
+                print(f"  [WRITE] gps_init = lat={home_lat:.6f}, lon={home_lon:.6f}")
+            else:
+                print(f"  gps_init already at lat={home_lat:.6f}, lon={home_lon:.6f}")
+
         reset_at = await _apply_post_action(session, args.post_action, dev_eui)
 
         ledger.record(dev_eui, {
@@ -569,6 +662,8 @@ async def _onboard_one_attempt(
             "region_after": summary["region_after"],
             "profile_applied": summary["profile_id"],
             "settings_written": summary["settings_written"],
+            "init_time_written": init_time_written,
+            "gps_home": {"lat": home_lat, "lon": home_lon} if home_lat is not None else None,
             "post_action": args.post_action,
             "reset_at": reset_at,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -773,13 +868,17 @@ def obscure_secret(s: str, keep_start: int = 6, keep_end: int = 4) -> str:
 
 
 def save_last_batch(path: Path, region: Optional[int],
-                    profile_id: Optional[str], force: bool) -> None:
-    """Save the wizard's region/profile/force answers for reuse on the next run."""
+                    profile_id: Optional[str], force: bool,
+                    home_lat: Optional[float] = None,
+                    home_lon: Optional[float] = None) -> None:
+    """Save the wizard's answers for reuse on the next run."""
     data = {
-        "version": 1,
+        "version": 2,
         "region": region,
         "profile_id": profile_id,
         "force": force,
+        "home_lat": home_lat,
+        "home_lon": home_lon,
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
     path.write_text(json.dumps(data, indent=2))
@@ -789,6 +888,7 @@ def load_last_batch(path: Path) -> Optional[dict]:
     """
     Load saved wizard answers. Validates each field; returns None if the file
     is missing, malformed, or references a region/profile that no longer exists.
+    Supports v1 (no home coords) and v2 (with home coords) on disk.
     """
     if not path.exists():
         return None
@@ -796,7 +896,7 @@ def load_last_batch(path: Path) -> Optional[dict]:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
-    if data.get("version") != 1:
+    if data.get("version") not in (1, 2):
         return None
     region = data.get("region")
     if region is not None and region not in REGIONS:
@@ -804,10 +904,18 @@ def load_last_batch(path: Path) -> Optional[dict]:
     profile_id = data.get("profile_id")
     if profile_id is not None and profile_id not in PROFILES_BY_ID:
         return None
+    home_lat = data.get("home_lat")
+    home_lon = data.get("home_lon")
+    if home_lat is not None and not isinstance(home_lat, (int, float)):
+        return None
+    if home_lon is not None and not isinstance(home_lon, (int, float)):
+        return None
     return {
         "region": region,
         "profile_id": profile_id,
         "force": bool(data.get("force", False)),
+        "home_lat": home_lat,
+        "home_lon": home_lon,
         "saved_at": data.get("saved_at"),
     }
 
@@ -1281,10 +1389,29 @@ def _region_label(code: int) -> str:
     return f"{REGIONS[code]:<12} ({code}){'  -- ' + desc if desc else ''}"
 
 
+def _validate_coord_pair(text: str) -> Optional[tuple[float, float]]:
+    """Parse 'lat,lon' into (float, float). Returns None for blank/invalid."""
+    if not text or not text.strip():
+        return None
+    try:
+        parts = [p.strip() for p in text.replace(";", ",").split(",")]
+        if len(parts) != 2:
+            return None
+        lat = float(parts[0])
+        lon = float(parts[1])
+        if not -90.0 <= lat <= 90.0:
+            return None
+        if not -180.0 <= lon <= 180.0:
+            return None
+        return lat, lon
+    except (ValueError, TypeError):
+        return None
+
+
 async def _ask_region_and_profile_and_force(
     args: argparse.Namespace,
-) -> Optional[tuple[Optional[int], Optional[dict], bool]]:
-    """Run the three core wizard prompts. Returns None on cancel."""
+) -> Optional[tuple[Optional[int], Optional[dict], bool, Optional[float], Optional[float]]]:
+    """Run the four core wizard prompts. Returns None on cancel."""
     NO_CHANGE = "__no_change__"
     ADVANCED = "__advanced__"
 
@@ -1335,7 +1462,26 @@ async def _ask_region_and_profile_and_force(
     if revisit is None:
         return None
 
-    return region, profile, bool(revisit)
+    # GPS home hint -- written to gps_init_lat/lon to speed up first GPS fix
+    # at the deployment site. Skipping is safe; the device just takes longer
+    # to acquire its first fix.
+    home_lat: Optional[float] = None
+    home_lon: Optional[float] = None
+    home_text = await asyncio.to_thread(
+        questionary.text(
+            "GPS home for first-fix hint (decimal lat,lon -- e.g. '30.0,-115.5'). "
+            "Set to your deployment area, NOT your current location. Press Enter "
+            "to skip.",
+            validate=lambda t: True if not t.strip() or _validate_coord_pair(t)
+                              else "Use 'lat,lon' with -90<=lat<=90 and -180<=lon<=180").ask
+    )
+    if home_text is None:
+        return None
+    parsed = _validate_coord_pair(home_text)
+    if parsed:
+        home_lat, home_lon = parsed
+
+    return region, profile, bool(revisit), home_lat, home_lon
 
 
 def _format_saved_summary(lns_cfg: Optional[dict], saved: dict) -> str:
@@ -1348,6 +1494,10 @@ def _format_saved_summary(lns_cfg: Optional[dict], saved: dict) -> str:
                    if profile_id else "no change")
     force_str = "yes (force re-visit)" if saved.get("force") else "no (skip already-onboarded)"
     saved_at = saved.get("saved_at", "?")
+    home_lat = saved.get("home_lat")
+    home_lon = saved.get("home_lon")
+    home_str = (f"lat={home_lat:.6f}, lon={home_lon:.6f}"
+                if home_lat is not None and home_lon is not None else "skip")
 
     lines = [f"Last batch saved {saved_at}:"]
     if lns_cfg:
@@ -1357,6 +1507,7 @@ def _format_saved_summary(lns_cfg: Optional[dict], saved: dict) -> str:
     lines.append(f"  Region:      {region_str}")
     lines.append(f"  Profile:     {profile_str}")
     lines.append(f"  Force:       {force_str}")
+    lines.append(f"  GPS home:    {home_str}")
     return "\n".join(lines)
 
 
@@ -1406,17 +1557,21 @@ async def run_wizard(args: argparse.Namespace) -> int:
             region = saved["region"]
             profile = PROFILES_BY_ID.get(saved["profile_id"]) if saved["profile_id"] else None
             args.force = bool(saved["force"])
+            args.home_lat = saved.get("home_lat")
+            args.home_lon = saved.get("home_lon")
             answers_came_from_save = True
             print("Using saved settings.\n")
 
-    # 3. If we didn't reuse, run the three prompts fresh.
+    # 3. If we didn't reuse, run the prompts fresh.
     if not answers_came_from_save:
         result = await _ask_region_and_profile_and_force(args)
         if result is None:
             print("Cancelled.")
             return 130
-        region, profile, force = result
+        region, profile, force, home_lat, home_lon = result
         args.force = force
+        args.home_lat = home_lat
+        args.home_lon = home_lon
 
         # Offer to save this set as the new defaults (only when we asked fresh)
         save = await asyncio.to_thread(
@@ -1428,7 +1583,7 @@ async def run_wizard(args: argparse.Namespace) -> int:
             try:
                 save_last_batch(LAST_BATCH_PATH, region,
                                 profile["id"] if profile else None,
-                                args.force)
+                                args.force, home_lat, home_lon)
                 print(f"  Saved to {LAST_BATCH_PATH}\n")
             except OSError as e:
                 print(f"  [WARN] Could not save: {e}\n")
@@ -1452,9 +1607,15 @@ async def run_wizard(args: argparse.Namespace) -> int:
     else:
         skip_str = "skip ledger-onboarded (LNS not queried; ledger is fallback)"
 
+    home_str = (f"lat={args.home_lat:.6f}, lon={args.home_lon:.6f}"
+                if args.home_lat is not None and args.home_lon is not None else "skip")
+    set_time_str = "no (--no-set-time)" if args.no_set_time else "yes (host UTC)"
+
     print("\nPlan:")
     print(f"  Region:                {region_str}")
     print(f"  Profile:               {profile_str}")
+    print(f"  GPS home (init):       {home_str}")
+    print(f"  Set device clock:      {set_time_str}")
     print(f"  Skip behavior:         {skip_str}")
     print(f"  Post-action:           cmd_reset (always reboot, see module docstring)")
     print(f"  Verification:          {verify_str}")
@@ -1485,15 +1646,384 @@ async def run_wizard(args: argparse.Namespace) -> int:
 # main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Report mode (read-only QA snapshot)
+# ---------------------------------------------------------------------------
+
+# Schema files that, if present, give us setting name + decode hints. We look
+# in a few places so the script works both standalone (OSS) and inside the
+# original buoy-fish-tech monorepo. Missing schema is fine -- the report
+# falls back to "unknown_0xXX" with raw hex for unrecognized IDs.
+SCHEMA_CANDIDATE_PATHS = [
+    SCRIPT_DIR / "settings_v7.0.0.json",
+    SCRIPT_DIR / "settings-v7.0.0.json",
+    SCRIPT_DIR.parent.parent / "prod" / "configure-buoy-fish" / "settings" / "settings_v7.0.0.json",
+    SCRIPT_DIR.parent.parent / "prod" / "configure-buoy-fish" / "settings" / "settings-v7.0.0.json",
+]
+META_CANDIDATE_PATHS = [
+    SCRIPT_DIR / "settings-meta.json",
+    SCRIPT_DIR.parent.parent / "prod" / "configure-buoy-fish" / "settings-meta.json",
+]
+
+# Settings whose values are sensitive and should be redacted in reports.
+SECRET_SETTING_NAMES: set[str] = {
+    "app_key", "lp0_app_key", "lp0_network_key", "s_band_app_key",
+    "s_band_network_key", "device_pin",
+}
+
+
+def load_settings_schema() -> dict[int, dict]:
+    """
+    Load {setting_id: {name, length, conversion}} from one of the candidate
+    schema files. Returns an empty dict if none found (report still works,
+    just without setting names).
+    """
+    for path in SCHEMA_CANDIDATE_PATHS:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        schema: dict[int, dict] = {}
+        for name, meta in data.get("settings", {}).items():
+            sid_raw = meta.get("id")
+            if sid_raw is None:
+                continue
+            try:
+                sid = int(sid_raw, 16) if isinstance(sid_raw, str) else int(sid_raw)
+            except (ValueError, TypeError):
+                continue
+            schema[sid] = {
+                "name": name,
+                "length": meta.get("length"),
+                "conversion": meta.get("conversion"),
+            }
+        return schema
+    return {}
+
+
+def load_settings_meta() -> dict[str, dict]:
+    """Load human-readable descriptions from settings-meta.json (optional)."""
+    for path in META_CANDIDATE_PATHS:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Top level may be a list or a dict depending on version
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            return {entry["name"]: entry for entry in data if "name" in entry}
+    return {}
+
+
+def decode_setting_value(name: str, raw: bytes, conversion: Optional[str]) -> object:
+    """Decode a raw setting value into a Python type based on its declared conversion."""
+    if name in SECRET_SETTING_NAMES:
+        return f"<redacted, {len(raw)} bytes>"
+    if not raw:
+        return None
+    try:
+        if conversion == "uint8":
+            return raw[0]
+        if conversion == "uint16":
+            return int.from_bytes(raw, "little", signed=False)
+        if conversion == "uint32":
+            return int.from_bytes(raw, "little", signed=False)
+        if conversion == "int32":
+            return int.from_bytes(raw, "little", signed=True)
+        if conversion == "bool":
+            return raw[0] != 0
+        if conversion == "string":
+            return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        if conversion in ("hex", "byte_array", None):
+            return raw.hex().upper()
+        # Fallback: best guess by length
+        if len(raw) == 1:
+            return raw[0]
+        if len(raw) in (2, 4):
+            return int.from_bytes(raw, "little", signed=False)
+        return raw.hex().upper()
+    except Exception:
+        return raw.hex().upper()
+
+
+def _format_coord(scaled: object) -> str:
+    """Format an int32-scaled coord as decimal degrees, with sign."""
+    if not isinstance(scaled, int):
+        return str(scaled)
+    return f"{int_to_coord(scaled):+.6f}"
+
+
+def _format_unix_ts(ts: object) -> str:
+    """Format a Unix timestamp as ISO8601 UTC, or '<unset>' for 0."""
+    if not isinstance(ts, int) or ts == 0:
+        return "<unset / 0>"
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return f"<invalid: {ts}>"
+
+
+def _render_device_report_md(record: dict) -> str:
+    """Render one device's record as a Markdown report."""
+    lines = [
+        f"# {record['ble_name']}  ({record['dev_eui']})",
+        "",
+        f"- **Generated:** {record['generated_at']}",
+        f"- **BLE address:** `{record['ble_address']}`",
+        f"- **Host:** {record['host']}",
+        "",
+    ]
+    # Network status
+    cs = record.get("chirpstack") or {}
+    lines.append("## Network status")
+    if not cs.get("queried"):
+        lines.append("- ChirpStack not queried.")
+    elif cs.get("devaddr"):
+        lines.append(f"- **ACTIVATED**  devAddr=`{cs['devaddr']}`  fCntUp={cs.get('fcnt_up')}")
+    elif cs.get("registered"):
+        lines.append("- Registered in application but **NOT ACTIVATED** (no JoinRequest accepted yet).")
+    else:
+        lines.append("- Not registered in ChirpStack application.")
+    lines.append("")
+
+    # Highlight key LoRa settings
+    decoded = record["settings_decoded"]
+    region = decoded.get("lr_region")
+    region_name = REGIONS.get(region, "?") if isinstance(region, int) else "?"
+    lines += [
+        "## LoRaWAN",
+        f"- `lr_region`: **{region}** ({region_name})",
+        f"- `device_eui`: `{decoded.get('device_eui', '?')}`",
+        f"- `app_eui`: `{decoded.get('app_eui', '?')}`",
+        f"- `app_key`: {decoded.get('app_key', '?')}",
+        f"- `lr_send_flag`: {decoded.get('lr_send_flag', '?')}",
+        f"- `lr_adr`: {decoded.get('lr_adr', '?')}  /  `lr_adr_profile`: {decoded.get('lr_adr_profile', '?')}",
+        "",
+    ]
+
+    # GPS / profile
+    lines += [
+        "## GPS profile",
+        f"- `lr_gps_interval`: {decoded.get('lr_gps_interval', '?')} s",
+        f"- `ublox_send_interval`: {decoded.get('ublox_send_interval', '?')} s",
+        f"- `ublox_send_interval_2`: {decoded.get('ublox_send_interval_2', '?')} s",
+        f"- `ublox_multiple_intervals`: {decoded.get('ublox_multiple_intervals', '?')}",
+        f"- `status_send_interval`: {decoded.get('status_send_interval', '?')} s",
+        f"- `enable_motion_trig_gps`: {decoded.get('enable_motion_trig_gps', '?')}",
+        f"- `motion_ths`: {decoded.get('motion_ths', '?')}",
+        f"- `gps_init_lat`: {_format_coord(decoded.get('gps_init_lat'))}",
+        f"- `gps_init_lon`: {_format_coord(decoded.get('gps_init_lon'))}",
+        f"- `init_time`: {_format_unix_ts(decoded.get('init_time'))}",
+        "",
+    ]
+
+    # Last known position from notifications captured during scan
+    lp = record.get("last_position")
+    if lp:
+        lines += [
+            "## Last known position (from device)",
+            f"- lat={lp.get('latitude')}  lon={lp.get('longitude')}  alt={lp.get('altitude')}",
+            f"- timestamp={_format_unix_ts(lp.get('timestamp'))}",
+            "",
+        ]
+
+    # All other settings, sorted by id
+    lines += ["## All settings", "", "| ID | Name | Decoded | Raw (hex) |",
+              "|---:|------|---------|-----------|"]
+    for sid in sorted(record["settings_raw"].keys()):
+        meta = record["schema"].get(sid, {})
+        name = meta.get("name", f"unknown_0x{sid:02X}")
+        decoded_v = record["settings_decoded"].get(name)
+        raw_hex = record["settings_raw"][sid]
+        lines.append(f"| 0x{sid:02X} | `{name}` | {decoded_v} | `{raw_hex}` |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+async def run_report(args: argparse.Namespace) -> int:
+    """
+    Read-only mode. Walk every IRNAS device in BLE range, read its full
+    settings dump, query ChirpStack for activation, and write per-device
+    Markdown + a combined JSONL log. NO writes, NO reboots.
+    """
+    schema = load_settings_schema()
+    schema_msg = (f"loaded {len(schema)} settings from schema"
+                  if schema else "no schema file found -- report will use raw IDs")
+    print(f"[report] schema: {schema_msg}")
+
+    lns_cfg: Optional[dict] = getattr(args, "_lns_cfg", None)
+    pre_run_addrs: dict[str, Optional[str]] = {}
+    app_devices: set[str] = set()
+    if lns_cfg and not args.no_verify:
+        try:
+            print(f"[report] querying ChirpStack at {lns_cfg['base_url']}...")
+            app_euis = await list_app_dev_euis(lns_cfg)
+            app_devices = {e.upper() for e in app_euis}
+            pre_run_addrs = await snapshot_activations(lns_cfg, app_euis) if app_euis else {}
+            print(f"[report] {len(app_devices)} devices in app, "
+                  f"{sum(1 for v in pre_run_addrs.values() if v)} activated")
+        except Exception as e:
+            print(f"[report] [WARN] LNS query failed: {type(e).__name__}: {e}")
+
+    reports_dir = SCRIPT_DIR / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    jsonl_path = reports_dir / f"device-reports-{timestamp}.jsonl"
+    print(f"[report] writing per-device Markdown to {reports_dir}/")
+    print(f"[report] writing combined JSONL to {jsonl_path}")
+    print()
+
+    sp_filter: Optional[set[str]] = set(args.sp) if args.sp else None
+    seen_this_run: set[str] = set()
+    written = 0
+    failed = 0
+
+    stopping = False
+
+    def _handle_sig(*_):
+        nonlocal stopping
+        stopping = True
+        print("\n[INTERRUPT] Finishing current device then exiting...")
+
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    empty_windows = 0
+    while not stopping:
+        found, stats = await scan_for_irnas(seen_this_run, sp_filter, args.scan_seconds)
+        print(f"[scan] {stats['irnas_seen']} IRNAS adverts in range, "
+              f"{stats['matched']} new")
+        if not found:
+            empty_windows += 1
+            if empty_windows >= args.idle_windows:
+                break
+            continue
+        empty_windows = 0
+
+        for device, adv_name in found:
+            if stopping:
+                break
+            print(f"\n--> {adv_name} @ {device.address}")
+            try:
+                async with asyncio.timeout(float(args.per_device_timeout)):
+                    async with DeviceSession(device) as session:
+                        dev_eui = await session.read_dev_eui()
+                        if not dev_eui:
+                            print(f"  [FAIL] could not read DevEUI")
+                            failed += 1
+                            continue
+                        print(f"  DevEUI: {dev_eui}")
+                        raw_settings = await session.read_all_settings()
+                        print(f"  Read {len(raw_settings)} settings")
+
+                        # Decode known settings by name
+                        decoded_by_name: dict[str, object] = {}
+                        raw_by_id_hex: dict[int, str] = {}
+                        for sid, raw in raw_settings.items():
+                            meta = schema.get(sid, {})
+                            name = meta.get("name", f"unknown_0x{sid:02X}")
+                            decoded_by_name[name] = decode_setting_value(
+                                name, raw, meta.get("conversion"))
+                            raw_by_id_hex[sid] = raw.hex().upper()
+
+                        # Last-known position is broadcast as an unsolicited
+                        # notification on connect; pull it from the rx buffer.
+                        last_position = _extract_last_position(session.rx_buffer)
+
+                        cs_status = {"queried": bool(lns_cfg and not args.no_verify),
+                                     "registered": dev_eui.upper() in app_devices,
+                                     "devaddr": pre_run_addrs.get(dev_eui.upper()),
+                                     "fcnt_up": None}
+
+                        record = {
+                            "dev_eui": dev_eui,
+                            "ble_name": adv_name,
+                            "ble_address": device.address,
+                            "host": _short_hostname(),
+                            "generated_at": datetime.now(timezone.utc).isoformat(),
+                            "schema_loaded": bool(schema),
+                            "settings_raw": raw_by_id_hex,
+                            "settings_decoded": decoded_by_name,
+                            "schema": schema,
+                            "last_position": last_position,
+                            "chirpstack": cs_status,
+                        }
+
+                        # Write per-device Markdown
+                        sp_safe = "".join(c for c in (adv_name or "device") if c.isalnum())
+                        md_path = reports_dir / f"{sp_safe}_{dev_eui}_{timestamp}.md"
+                        md_path.write_text(_render_device_report_md(record))
+                        print(f"  Wrote {md_path.name}")
+
+                        # Append to JSONL (without the schema, to keep lines small)
+                        jsonl_record = {k: v for k, v in record.items() if k != "schema"}
+                        with jsonl_path.open("a") as f:
+                            f.write(json.dumps(jsonl_record, default=str) + "\n")
+                        written += 1
+            except asyncio.TimeoutError:
+                print(f"  [FAIL] per-device timeout after {args.per_device_timeout}s")
+                failed += 1
+            except Exception as e:
+                print(f"  [FAIL] {type(e).__name__}: {e}")
+                failed += 1
+            await asyncio.sleep(INTER_DEVICE_PAUSE_SEC)
+
+    print("\n" + "=" * 48)
+    print("Report Summary")
+    print("=" * 48)
+    print(f"  Devices reported: {written}")
+    print(f"  Failed:           {failed}")
+    print(f"  Markdown:         {reports_dir}/")
+    print(f"  JSONL:            {jsonl_path}")
+    return 0 if failed == 0 else 1
+
+
+def _short_hostname() -> str:
+    try:
+        import socket
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
+
+
+def _extract_last_position(rx_buffer: list[bytes]) -> Optional[dict]:
+    """
+    The IRNAS firmware pushes a 'last position' record on the 0x1F port shortly
+    after connect: [0x1F, 0xFE, 0x10, lat(4), lon(4), alt(4), ts(4)] (signed int32 each).
+    """
+    for frame in rx_buffer:
+        if len(frame) >= 19 and frame[0] == 0x1F and frame[1] == 0xFE and frame[2] == 0x10:
+            try:
+                lat = int.from_bytes(frame[3:7], "little", signed=True) / COORD_SCALE
+                lon = int.from_bytes(frame[7:11], "little", signed=True) / COORD_SCALE
+                alt = int.from_bytes(frame[11:15], "little", signed=True)
+                ts = int.from_bytes(frame[15:19], "little", signed=False)
+                return {"latitude": lat, "longitude": lon, "altitude": alt, "timestamp": ts}
+            except Exception:
+                return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Wizard routing
+# ---------------------------------------------------------------------------
+
+
 def _is_wizard_invocation(args: argparse.Namespace) -> bool:
     """True if the user ran the script bare (no relevant flags) -> launch wizard."""
-    if args.list_mode or args.by_address:
+    if args.list_mode or args.by_address or args.report:
         return False
     if args.sp or args.dev_eui:
         return False
     if args.region is not None or args.profile is not None:
         return False
     if args.dry_run or args.force:
+        return False
+    if args.home_lat is not None or args.home_lon is not None:
         return False
     if not sys.stdin.isatty():
         return False
@@ -1532,6 +2062,18 @@ def main() -> int:
                              "If omitted: keep each device's current region.")
     parser.add_argument("--profile", choices=[p["id"] for p in UPLINK_PROFILES], default=None,
                         help="Apply a quick profile by id.")
+    parser.add_argument("--no-set-time", action="store_true",
+                        help="Don't write the device's init_time. Default is to set it to "
+                             "the host's current UTC time on every visit.")
+    parser.add_argument("--home-lat", type=float, default=None, metavar="DEG",
+                        help="Set gps_init_lat (decimal degrees) as a GPS first-fix hint. "
+                             "Use with --home-lon. Skipped if either is omitted.")
+    parser.add_argument("--home-lon", type=float, default=None, metavar="DEG",
+                        help="Set gps_init_lon (decimal degrees). Use with --home-lat.")
+    parser.add_argument("--report", action="store_true",
+                        help="Read-only mode: connect to every IRNAS device in range, dump "
+                             "all settings + ChirpStack activation status to ./reports/, do not "
+                             "write or reboot. Useful for QA snapshots and audits.")
 
     post_group = parser.add_mutually_exclusive_group()
     post_group.add_argument("--no-rejoin", dest="post_action", action="store_const", const="none",
@@ -1574,6 +2116,8 @@ def main() -> int:
     try:
         if args.list_mode:
             return asyncio.run(list_mode(args))
+        if args.report:
+            return asyncio.run(run_report(args))
         if _is_wizard_invocation(args):
             return asyncio.run(run_wizard(args))
         if args.by_address:
