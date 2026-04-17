@@ -6,9 +6,9 @@
 # GPS fix and uplink it via LoRaWAN. Useful for getting fresh pins on a map
 # without waiting for the device's natural status_send_interval to elapse.
 #
-# Does NOT write region/profile/home settings, does NOT reboot. Only writes
-# init_time (host UTC, helps GPS cold-start) and sends commands. Shares the
-# ledger with batch-onboard.
+# READ-ONLY on settings: does NOT modify any persisted setting on the device
+# (region, profile, init_time, GPS home, etc.). Only sends commands. Shares
+# the ledger with batch-onboard.
 #
 # Usage:
 #   ./batch-locate.sh                    # locate every IRNAS device in range

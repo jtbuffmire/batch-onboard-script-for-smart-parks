@@ -2056,8 +2056,10 @@ async def run_locate(args: argparse.Namespace) -> int:
     GPS fix and uplink it via LoRaWAN. Optionally waits and verifies via
     ChirpStack that uplinks were observed (fCntUp incremented).
 
-    Does NOT write region/profile/home settings, does NOT reboot. Only
-    writes init_time (host UTC, helps cold-start GPS) and sends commands.
+    READ-ONLY ON SETTINGS. This mode does not modify any persisted setting on
+    the device -- not region, not profile, not init_time, not GPS home, not
+    anything. It only sends commands (cmd_get_ublox_fix, optionally
+    cmd_send_status_lr) and reads the post-connect last_position notification.
 
     Shares the ledger with batch-onboard. Each visited device gets a
     `last_locate_at` and `last_position_from_ble` field added to its entry.
@@ -2149,19 +2151,16 @@ async def run_locate(args: argparse.Namespace) -> int:
                                   f"uplink has nowhere to land. Run batch-onboard first.")
                             skipped_inactive.append((adv_name, dev_eui))
 
-                        # Set the device clock first; helps GPS cold-start avoid the
-                        # "no time, no almanac, no fix" worst case.
-                        if not args.no_set_time:
-                            ts = await session.write_init_time()
-                            print(f"  Set init_time = {ts} ({_format_unix_ts(ts)})")
-
-                        # Trigger the GPS fix + LoRa uplink.
+                        # Locate mode is intentionally read-only on settings.
+                        # The only thing we send are COMMANDS (not setting writes):
+                        # cmd_get_ublox_fix triggers a GPS fix + LoRa uplink, and
+                        # optionally cmd_send_status_lr forces an immediate status
+                        # uplink. No persisted setting on the device is modified.
                         await session.send_get_ublox_fix()
                         print(f"  Sent cmd_get_ublox_fix (0xB8) -- device will fix and "
                               f"uplink within ~30s-2min outdoors.")
                         located_at = datetime.now(timezone.utc).isoformat()
 
-                        # Optionally also force a status uplink (immediate, no GPS wait).
                         if args.also_send_status:
                             await session.send_status_lr()
                             print(f"  Sent cmd_send_status_lr (0xAD) -- forces a status uplink.")
@@ -2339,11 +2338,11 @@ def main() -> int:
                              "all settings + ChirpStack activation status to ./reports/, do not "
                              "write or reboot. Useful for QA snapshots and audits.")
     parser.add_argument("--locate", action="store_true",
-                        help="Locate mode: for every IRNAS device in BLE range, set init_time "
-                             "and trigger cmd_get_ublox_fix (0xB8) to acquire a fresh GPS fix "
-                             "and uplink it. Optionally waits and verifies new uplinks via "
-                             "ChirpStack fCntUp deltas. Does NOT write region/profile, does NOT "
-                             "reboot. Shares the ledger with batch-onboard.")
+                        help="Locate mode: for every IRNAS device in BLE range, trigger "
+                             "cmd_get_ublox_fix (0xB8) to acquire a fresh GPS fix and uplink it. "
+                             "Optionally waits and verifies new uplinks via ChirpStack fCntUp "
+                             "deltas. READ-ONLY ON SETTINGS: does not modify any persisted "
+                             "setting on the device. Shares the ledger with batch-onboard.")
     parser.add_argument("--locate-wait-min", type=int, default=DEFAULT_LOCATE_WAIT_MIN,
                         help=f"Minutes to wait after the last GPS-fix command before checking "
                              f"ChirpStack for new uplinks (default: {DEFAULT_LOCATE_WAIT_MIN}). "

@@ -228,11 +228,15 @@ to skipping LNS-active devices). `--force` bypasses both.
 ./batch-locate.sh
 ```
 
-Walks every IRNAS device in BLE range and tells each one to:
+Walks every IRNAS device in BLE range and tells each one to acquire a
+fresh u-blox GPS fix and uplink it over LoRaWAN
+(`cmd_get_ublox_fix` / `0xB8`).
 
-1. Set its clock to host UTC (helps GPS cold-start avoid the worst-case fix time)
-2. Acquire a fresh u-blox GPS fix and uplink it over LoRaWAN
-   (`cmd_get_ublox_fix` / `0xB8`)
+**Read-only on settings.** Locate mode does NOT modify any persisted
+setting on the device — not region, profile, `init_time`, `gps_init_lat`,
+or anything else. It only sends commands (events, not writes) and reads
+the post-connect `last_position` notification. Safe to run against a
+fully-configured fleet without disturbing sessions or changing config.
 
 Useful when you want pins on a map _now_ instead of waiting for the
 device's natural `status_send_interval` (which is hours on most profiles).
