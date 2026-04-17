@@ -222,6 +222,52 @@ when any non-trivial flag is present.
 By default the script skips devices already in the ledger (in addition
 to skipping LNS-active devices). `--force` bypasses both.
 
+## Locate mode (force fresh GPS pins)
+
+```bash
+./batch-locate.sh
+```
+
+Walks every IRNAS device in BLE range and tells each one to:
+
+1. Set its clock to host UTC (helps GPS cold-start avoid the worst-case fix time)
+2. Acquire a fresh u-blox GPS fix and uplink it over LoRaWAN
+   (`cmd_get_ublox_fix` / `0xB8`)
+
+Useful when you want pins on a map _now_ instead of waiting for the
+device's natural `status_send_interval` (which is hours on most profiles).
+
+After the BLE loop, the script waits a few minutes (default 3, controlled
+with `--locate-wait-min`) and queries ChirpStack to confirm new uplinks
+landed by comparing each device's `fCntUp` before vs after. Output:
+
+```
+=== Locate verification (3 min after last cmd_get_ublox_fix) ===
+  New uplinks observed:  3/4
+  Silent (no new uplink): 1/4
+
+  Uplinked since locate (likely have fresh pins on the map):
+    SP100272   0016C001F09C7576  +1 uplink(s)
+    ...
+  No new uplinks (GPS may not have fixed; check coverage):
+    SP100334   0016C001F09C7659
+```
+
+**Does NOT write region/profile/home/force-reboot anything** — safe to run
+against a fully-configured fleet without disturbing sessions.
+
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--sp SP#` | Locate only specific devices (filter by advertised SP#). |
+| `--dev-eui HEX` | Locate only specific DevEUIs. |
+| `--also-send-status` | Also send `cmd_send_status_lr` (0xAD) for an immediate status uplink — useful when GPS is questionable but you want a "device is alive" pin. |
+| `--locate-wait-min N` | Minutes to wait before checking ChirpStack (default 3). Set to 0 to skip verification. |
+| `--no-verify` | Skip the ChirpStack pre/post snapshot entirely. |
+
+Behind the scenes this is just `./batch-onboard.sh --locate "$@"`.
+
 ## Report mode (read-only QA snapshot)
 
 ```bash
@@ -283,7 +329,8 @@ endpoint in parallel.
 | File | What it does |
 |---|---|
 | [`batch-onboard.sh`](./batch-onboard.sh) | Bash wrapper: env check, venv, deps, exec the Python script. |
-| [`batch-onboard-us915.py`](./batch-onboard-us915.py) | Wizard, BLE main loop, pre-flight skip, post-flight verification. |
+| [`batch-locate.sh`](./batch-locate.sh) | Wrapper that runs the Python script in `--locate` mode. |
+| [`batch-onboard-us915.py`](./batch-onboard-us915.py) | Wizard, BLE main loop, pre-flight skip, post-flight verification, locate, report. |
 | [`check-onboarded-status.py`](./check-onboarded-status.py) | Standalone activation-based ChirpStack query. |
 | [`requirements.txt`](./requirements.txt) | `bleak`, `questionary`. |
 | [`.env.example`](./.env.example) | Template for credentials. Copy to `.env`. |

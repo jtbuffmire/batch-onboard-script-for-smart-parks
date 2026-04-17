@@ -112,6 +112,8 @@ CMD_GET_SETTING = 0xA8
 CMD_SEND_ALL_SETTINGS = 0xA7  # device dumps every setting it knows
 CMD_JOIN = 0xA0   # trigger LoRa rejoin (re-init stack with current config)
 CMD_RESET = 0xA1  # full device reboot -- the only reliable way to force a real JR
+CMD_SEND_STATUS_LR = 0xAD     # force a status uplink (battery, last-known position, etc.)
+CMD_GET_UBLOX_FIX = 0xB8      # trigger a fresh u-blox GPS fix and send the result over LoRa
 CMD_CONFIRM_PORT = 0x1F       # device replies on this port to confirm a command
 
 SETTING_LR_REGION = 0x0F
@@ -525,6 +527,24 @@ class DeviceSession:
     async def send_reset(self) -> None:
         """Fire cmd_reset (0xA1). Wipes RAM session, forces fresh OTAA on persisted region."""
         await self._write(bytes([PORT_COMMANDS, CMD_RESET, 0x00]))
+        await asyncio.sleep(0.3)
+
+    async def send_get_ublox_fix(self) -> None:
+        """
+        Fire cmd_get_ublox_fix (0xB8). Tells the device to wake the u-blox GPS
+        receiver, acquire a fix, and send the result as a LoRaWAN uplink.
+        Returns immediately; the actual GPS fix can take 30s-2min outdoors.
+        """
+        await self._write(bytes([PORT_COMMANDS, CMD_GET_UBLOX_FIX, 0x00]))
+        await asyncio.sleep(0.3)
+
+    async def send_status_lr(self) -> None:
+        """
+        Fire cmd_send_status_lr (0xAD). Forces an immediate status uplink
+        (battery, last-known position, sensor states) without waiting for
+        the natural status_send_interval.
+        """
+        await self._write(bytes([PORT_COMMANDS, CMD_SEND_STATUS_LR, 0x00]))
         await asyncio.sleep(0.3)
 
 
@@ -1023,20 +1043,26 @@ def _http_get_json(url: str, api_key: str, timeout: float = 15.0) -> Optional[di
         return None
 
 
-def query_activation(lns_cfg: dict, dev_eui: str) -> Optional[str]:
+def query_activation_full(lns_cfg: dict, dev_eui: str) -> dict:
     """
-    Returns the device's current devAddr (string) if it has an activation,
-    or None if it has never joined / activation is empty.
+    Returns {'devaddr': str|None, 'fcnt_up': int|None}. Empty dict on error.
     """
     url = f"{lns_cfg['base_url'].rstrip('/')}/api/devices/{dev_eui.lower()}/activation"
     data = _http_get_json(url, lns_cfg["api_key"])
     if not data:
-        return None
+        return {"devaddr": None, "fcnt_up": None}
     activation = data.get("deviceActivation")
     if not activation:
-        return None
-    devaddr = activation.get("devAddr")
-    return devaddr if devaddr else None
+        return {"devaddr": None, "fcnt_up": None}
+    return {
+        "devaddr": activation.get("devAddr") or None,
+        "fcnt_up": activation.get("fCntUp"),
+    }
+
+
+def query_activation(lns_cfg: dict, dev_eui: str) -> Optional[str]:
+    """Backwards-compatible: just returns devAddr or None."""
+    return query_activation_full(lns_cfg, dev_eui).get("devaddr")
 
 
 async def snapshot_activations(lns_cfg: dict, dev_euis: list[str]) -> dict[str, Optional[str]]:
@@ -1044,20 +1070,29 @@ async def snapshot_activations(lns_cfg: dict, dev_euis: list[str]) -> dict[str, 
     Query the activation endpoint for each DevEUI in parallel.
     Returns {dev_eui_upper: devAddr_or_None}.
     """
+    full = await snapshot_activations_full(lns_cfg, dev_euis)
+    return {eui: data["devaddr"] for eui, data in full.items()}
+
+
+async def snapshot_activations_full(lns_cfg: dict, dev_euis: list[str]) -> dict[str, dict]:
+    """
+    Query the activation endpoint for each DevEUI in parallel, returning the
+    full {devaddr, fcnt_up} dict per device. Used by both verify_joins() and
+    the locate flow (which needs fcnt_up to detect new uplinks).
+    """
     from concurrent.futures import ThreadPoolExecutor
 
-    def _one(eui: str) -> tuple[str, Optional[str]]:
-        return eui.upper(), query_activation(lns_cfg, eui)
+    def _one(eui: str) -> tuple[str, dict]:
+        return eui.upper(), query_activation_full(lns_cfg, eui)
 
-    out: dict[str, Optional[str]] = {}
+    out: dict[str, dict] = {}
     loop = asyncio.get_event_loop()
-    # Cap concurrency to avoid hammering the API.
     with ThreadPoolExecutor(max_workers=10) as pool:
         results = await loop.run_in_executor(
             None, lambda: list(pool.map(_one, dev_euis))
         )
-    for eui, devaddr in results:
-        out[eui] = devaddr
+    for eui, data in results:
+        out[eui] = data
     return out
 
 
@@ -2009,13 +2044,242 @@ def _extract_last_position(rx_buffer: list[bytes]) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Locate mode (trigger fresh GPS fixes for fast pin acquisition)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LOCATE_WAIT_MIN = 3   # how long to wait for GPS uplinks before checking
+
+
+async def run_locate(args: argparse.Namespace) -> int:
+    """
+    Walk every IRNAS device in BLE range and tell each one to acquire a fresh
+    GPS fix and uplink it via LoRaWAN. Optionally waits and verifies via
+    ChirpStack that uplinks were observed (fCntUp incremented).
+
+    Does NOT write region/profile/home settings, does NOT reboot. Only
+    writes init_time (host UTC, helps cold-start GPS) and sends commands.
+
+    Shares the ledger with batch-onboard. Each visited device gets a
+    `last_locate_at` and `last_position_from_ble` field added to its entry.
+    """
+    ledger = Ledger(LEDGER_PATH)
+    print(f"Ledger: {LEDGER_PATH} ({ledger.count_ok()} devices in ledger)")
+
+    sp_filter: Optional[set[str]] = set(args.sp) if args.sp else None
+    dev_eui_filter: Optional[set[str]] = set(args.dev_eui) if args.dev_eui else None
+    if sp_filter:
+        print(f"SP filter: {len(sp_filter)} SP number(s).")
+    if dev_eui_filter:
+        print(f"DevEUI filter: {len(dev_eui_filter)} DevEUI(s).")
+
+    # Pre-flight: capture fCntUp baseline so we can detect new uplinks.
+    lns_cfg: Optional[dict] = getattr(args, "_lns_cfg", None)
+    pre_fcnt: dict[str, dict] = {}
+    if lns_cfg and not args.no_verify:
+        try:
+            print(f"\nCapturing pre-locate fCntUp baseline from ChirpStack...")
+            app_euis = await list_app_dev_euis(lns_cfg)
+            if app_euis:
+                pre_fcnt = await snapshot_activations_full(lns_cfg, app_euis)
+                joined = sum(1 for v in pre_fcnt.values() if v["devaddr"])
+                print(f"  Snapshot: {len(app_euis)} devices in app, {joined} activated.")
+            else:
+                print("  [WARN] No devices in app; uplink verification will be limited.")
+        except Exception as e:
+            print(f"  [WARN] Pre-locate snapshot failed: {type(e).__name__}: {e}.")
+    print()
+
+    stopping = False
+
+    def _handle_sig(*_):
+        nonlocal stopping
+        stopping = True
+        print("\n[INTERRUPT] Finishing current device then exiting...")
+
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    seen: set[str] = set()
+    located: list[tuple[str, str]] = []  # (sp, dev_eui)
+    failed: list[tuple[str, str]] = []   # (label, address)
+    skipped_inactive: list[tuple[str, str]] = []  # (sp, dev_eui) -- not joined, fix won't reach LNS
+    empty_windows = 0
+
+    while not stopping:
+        found, stats = await scan_for_irnas(seen, sp_filter, args.scan_seconds)
+        print(f"[scan] {stats['irnas_seen']} IRNAS adverts in range, "
+              f"{stats['matched']} new")
+        if not found:
+            empty_windows += 1
+            if empty_windows >= args.idle_windows:
+                break
+            continue
+        empty_windows = 0
+
+        for device, adv_name in found:
+            if stopping:
+                break
+            print(f"\n--> {adv_name} @ {device.address}")
+            try:
+                async with asyncio.timeout(float(args.per_device_timeout)):
+                    async with DeviceSession(device) as session:
+                        dev_eui = await session.read_dev_eui()
+                        if not dev_eui:
+                            print(f"  [FAIL] could not read DevEUI")
+                            failed.append((adv_name, device.address))
+                            continue
+                        print(f"  DevEUI: {dev_eui}")
+
+                        if dev_eui_filter is not None and dev_eui not in dev_eui_filter:
+                            print(f"  [SKIP] not in --dev-eui filter")
+                            continue
+
+                        last_pos = _extract_last_position(session.rx_buffer)
+                        if last_pos:
+                            print(f"  Last known position (from device, possibly stale): "
+                                  f"lat={last_pos['latitude']:.6f}, "
+                                  f"lon={last_pos['longitude']:.6f}, "
+                                  f"ts={_format_unix_ts(last_pos.get('timestamp'))}")
+
+                        # Note: if the device has no LNS activation, the GPS uplink
+                        # we trigger has nowhere to go. Warn but still send -- maybe
+                        # the user is locating in a different network.
+                        cs_data = pre_fcnt.get(dev_eui.upper())
+                        if cs_data and not cs_data["devaddr"]:
+                            print(f"  [WARN] Device not activated on ChirpStack -- the GPS "
+                                  f"uplink has nowhere to land. Run batch-onboard first.")
+                            skipped_inactive.append((adv_name, dev_eui))
+
+                        # Set the device clock first; helps GPS cold-start avoid the
+                        # "no time, no almanac, no fix" worst case.
+                        if not args.no_set_time:
+                            ts = await session.write_init_time()
+                            print(f"  Set init_time = {ts} ({_format_unix_ts(ts)})")
+
+                        # Trigger the GPS fix + LoRa uplink.
+                        await session.send_get_ublox_fix()
+                        print(f"  Sent cmd_get_ublox_fix (0xB8) -- device will fix and "
+                              f"uplink within ~30s-2min outdoors.")
+                        located_at = datetime.now(timezone.utc).isoformat()
+
+                        # Optionally also force a status uplink (immediate, no GPS wait).
+                        if args.also_send_status:
+                            await session.send_status_lr()
+                            print(f"  Sent cmd_send_status_lr (0xAD) -- forces a status uplink.")
+
+                        # Update or create ledger entry. Don't overwrite onboarding
+                        # state; just append locate fields.
+                        existing = ledger.data["devices"].get(dev_eui, {})
+                        existing.update({
+                            "ble_address": device.address,
+                            "ble_name": adv_name,
+                            "last_locate_at": located_at,
+                            "last_position_from_ble": last_pos,
+                        })
+                        # If the device wasn't already in the ledger, mark it minimally.
+                        existing.setdefault("status", "located-only")
+                        ledger.record(dev_eui, existing)
+                        located.append((adv_name, dev_eui))
+                        print(f"  [OK] {dev_eui}")
+            except asyncio.TimeoutError:
+                print(f"  [FAIL] per-device timeout after {args.per_device_timeout}s")
+                failed.append((adv_name, device.address))
+            except Exception as e:
+                print(f"  [FAIL] {type(e).__name__}: {e}")
+                failed.append((adv_name, device.address))
+            await asyncio.sleep(INTER_DEVICE_PAUSE_SEC)
+
+    print("\n" + "=" * 48)
+    print("Locate Summary")
+    print("=" * 48)
+    print(f"  Devices located: {len(located)}")
+    print(f"  Failed:          {len(failed)}")
+    if skipped_inactive:
+        print(f"  Not on LNS:      {len(skipped_inactive)}  (fix sent but uplink has nowhere to land)")
+    if failed:
+        print("\n  Failed devices:")
+        for label, addr in failed:
+            print(f"    {label} @ {addr}")
+
+    # Post-flight uplink verification
+    if (lns_cfg and not args.no_verify and located
+            and args.locate_wait_min > 0):
+        await _verify_locate_uplinks(lns_cfg, located, pre_fcnt, args.locate_wait_min)
+    elif located and not args.no_verify and not lns_cfg:
+        print("\n[INFO] Skipping uplink verification (no ChirpStack credentials). "
+              "Watch your map system for fresh pins from the located devices.")
+
+    return 0 if not failed else 1
+
+
+async def _verify_locate_uplinks(
+    lns_cfg: dict,
+    located: list[tuple[str, str]],
+    pre_fcnt: dict[str, dict],
+    wait_min: int,
+) -> None:
+    """Wait, then check whether each located device's fCntUp incremented."""
+    print(f"\nWaiting {wait_min} min for GPS uplinks to land in ChirpStack...")
+    for remaining in range(wait_min, 0, -1):
+        sys.stdout.write(f"\r  {remaining} min remaining...   ")
+        sys.stdout.flush()
+        await asyncio.sleep(60)
+    sys.stdout.write("\r                                  \r")
+    sys.stdout.flush()
+
+    print(f"Re-querying ChirpStack for {len(located)} device(s)...")
+    located_euis = [eui for _sp, eui in located]
+    post = await snapshot_activations_full(lns_cfg, located_euis)
+
+    uplinked: list[tuple[str, str, int]] = []   # (sp, eui, delta)
+    silent: list[tuple[str, str]] = []          # (sp, eui)
+    not_joined: list[tuple[str, str]] = []      # (sp, eui) -- no devAddr at all
+
+    for sp, eui in located:
+        post_data = post.get(eui.upper(), {})
+        if not post_data.get("devaddr"):
+            not_joined.append((sp, eui))
+            continue
+        post_fcnt = post_data.get("fcnt_up")
+        before_data = pre_fcnt.get(eui.upper(), {})
+        before_fcnt = before_data.get("fcnt_up") if before_data else None
+        if post_fcnt is None:
+            silent.append((sp, eui))
+            continue
+        delta = post_fcnt - (before_fcnt if before_fcnt is not None else 0)
+        if delta > 0:
+            uplinked.append((sp, eui, delta))
+        else:
+            silent.append((sp, eui))
+
+    print(f"\n=== Locate verification ({wait_min} min after last cmd_get_ublox_fix) ===")
+    print(f"  New uplinks observed:  {len(uplinked)}/{len(located)}")
+    print(f"  Silent (no new uplink): {len(silent)}/{len(located)}")
+    if not_joined:
+        print(f"  Not joined to LNS:      {len(not_joined)}/{len(located)}")
+
+    if uplinked:
+        print("\n  Uplinked since locate (likely have fresh pins on the map):")
+        for sp, eui, delta in sorted(uplinked):
+            print(f"    {sp:<10} {eui}  +{delta} uplink(s)")
+    if silent:
+        print("\n  No new uplinks (GPS may not have fixed; check coverage):")
+        for sp, eui in sorted(silent):
+            print(f"    {sp:<10} {eui}")
+    if not_joined:
+        print("\n  Not joined to ChirpStack -- the locate fix had nowhere to land:")
+        for sp, eui in sorted(not_joined):
+            print(f"    {sp:<10} {eui}")
+        print("  Run batch-onboard.sh to onboard these first.")
+
+
+# ---------------------------------------------------------------------------
 # Wizard routing
 # ---------------------------------------------------------------------------
 
 
 def _is_wizard_invocation(args: argparse.Namespace) -> bool:
     """True if the user ran the script bare (no relevant flags) -> launch wizard."""
-    if args.list_mode or args.by_address or args.report:
+    if args.list_mode or args.by_address or args.report or args.locate:
         return False
     if args.sp or args.dev_eui:
         return False
@@ -2074,6 +2338,19 @@ def main() -> int:
                         help="Read-only mode: connect to every IRNAS device in range, dump "
                              "all settings + ChirpStack activation status to ./reports/, do not "
                              "write or reboot. Useful for QA snapshots and audits.")
+    parser.add_argument("--locate", action="store_true",
+                        help="Locate mode: for every IRNAS device in BLE range, set init_time "
+                             "and trigger cmd_get_ublox_fix (0xB8) to acquire a fresh GPS fix "
+                             "and uplink it. Optionally waits and verifies new uplinks via "
+                             "ChirpStack fCntUp deltas. Does NOT write region/profile, does NOT "
+                             "reboot. Shares the ledger with batch-onboard.")
+    parser.add_argument("--locate-wait-min", type=int, default=DEFAULT_LOCATE_WAIT_MIN,
+                        help=f"Minutes to wait after the last GPS-fix command before checking "
+                             f"ChirpStack for new uplinks (default: {DEFAULT_LOCATE_WAIT_MIN}). "
+                             f"Set to 0 to skip uplink verification.")
+    parser.add_argument("--also-send-status", action="store_true",
+                        help="In --locate mode, also send cmd_send_status_lr (0xAD) for an "
+                             "immediate status uplink in addition to the GPS fix command.")
 
     post_group = parser.add_mutually_exclusive_group()
     post_group.add_argument("--no-rejoin", dest="post_action", action="store_const", const="none",
@@ -2118,6 +2395,8 @@ def main() -> int:
             return asyncio.run(list_mode(args))
         if args.report:
             return asyncio.run(run_report(args))
+        if args.locate:
+            return asyncio.run(run_locate(args))
         if _is_wizard_invocation(args):
             return asyncio.run(run_wizard(args))
         if args.by_address:
