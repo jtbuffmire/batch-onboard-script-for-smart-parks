@@ -14,10 +14,14 @@ Credential discovery (in order):
   3. Process environment variables (CHIRPSTACK_BASE_URL etc.)
 
 Usage:
-    python3 check-onboarded-status.py
-    python3 check-onboarded-status.py --only-silent    # devices that never joined
-    python3 check-onboarded-status.py --only-joined    # devices that have joined
-    python3 check-onboarded-status.py --lns-env /path/to/.env
+    ./check-onboarded-status.sh                       # recommended (auto venv)
+    ./check-onboarded-status.sh --only-silent         # devices that never joined
+    ./check-onboarded-status.sh --only-joined         # devices that have joined
+    ./check-onboarded-status.sh --lns-env /path/to/.env
+
+Direct python invocation also works (this script is stdlib-only and has no
+third-party deps), but the wrapper keeps the UX consistent with the rest of
+the toolkit.
 """
 
 import argparse
@@ -78,6 +82,24 @@ def resolve_lns_config(args: argparse.Namespace) -> tuple[Optional[str], Optiona
     return base_url, api_key
 
 
+APP_URL = os.environ.get("BUOY_APP_URL", "https://app.buoy.fish")
+
+
+def fetch_app_state(dev_eui: str) -> str:
+    """The third registry (ADR-0025 stage 1): 'registered' | 'unregistered' | 'unknown'.
+    Public, unauthenticated GET; 'unknown' is never folded into 'unregistered'."""
+    req = urllib.request.Request(
+        f"{APP_URL.rstrip('/')}/api/devices/lookup/{dev_eui.upper()}",
+        headers={"Accept": "application/json", "User-Agent": "check-onboarded-status/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            return "registered"
+    except urllib.error.HTTPError as e:
+        return "unregistered" if e.code == 404 else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def fetch_activation(base_url: str, api_key: str, dev_eui: str) -> dict:
     """Returns {devaddr: str|None, fcnt_up: int|None, error: str|None}."""
     url = f"{base_url.rstrip('/')}/api/devices/{dev_eui.lower()}/activation"
@@ -133,11 +155,13 @@ def main() -> int:
     print(f"Checking activation for {len(devices)} devices against {base_url}...\n")
 
     results = []  # (sp_name, dev_eui, status, devaddr_or_error, fcnt_up)
+    app_states: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {
             pool.submit(fetch_activation, base_url, api_key, eui): (eui, entry)
             for eui, entry in devices.items()
         }
+        app_futures = {pool.submit(fetch_app_state, eui): eui for eui in devices}
         for future in as_completed(futures):
             eui, entry = futures[future]
             sp_name = entry.get("ble_name", "?")
@@ -148,11 +172,24 @@ def main() -> int:
                 results.append((sp_name, eui, "JOINED", r["devaddr"], r["fcnt_up"]))
             else:
                 results.append((sp_name, eui, "NEVER JOINED", "-", None))
+        for future in as_completed(app_futures):
+            app_states[app_futures[future]] = future.result()
 
     results.sort()
     joined = [r for r in results if r[2] == "JOINED"]
     silent = [r for r in results if r[2] == "NEVER JOINED"]
     errors = [r for r in results if r[2] == "ERROR"]
+    # Two of three registries is a failure to surface (ADR-0025 D1).
+    not_in_app = [r for r in joined if app_states.get(r[1]) == "unregistered"]
+    app_unknown = [r for r in results if app_states.get(r[1]) == "unknown"]
+    if not_in_app:
+        print(f"JOINED BUT NOT IN APP ({len(not_in_app)}) -- invisible to every customer; "
+              f"register with batch-onboard.sh --register-app --org <id|name>:")
+        for sp, eui, _status, devaddr, _f in not_in_app:
+            print(f"  {sp:<10} {eui}  devAddr={devaddr}")
+        print()
+    if app_unknown:
+        print(f"App registry could not be checked for {len(app_unknown)} device(s) -- status UNKNOWN.\n")
 
     def show(rows):
         for sp, eui, status, detail, fcnt in rows:

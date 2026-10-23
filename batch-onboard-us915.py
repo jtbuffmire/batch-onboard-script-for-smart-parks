@@ -21,19 +21,21 @@ The only authoritative source of truth for "joined" is the network server
 
 Usage
 -----
-Bare invocation runs the interactive wizard:
+Always invoke through the wrapper -- it sets up .venv and installs deps:
 
-    ./batch-onboard.sh                         # the recommended entry point
-    python3 batch-onboard-us915.py             # equivalent if your venv is active
+    ./batch-onboard.sh                         # interactive wizard
 
-Non-interactive flags skip the wizard and behave like the legacy script:
+Non-interactive flags skip the wizard:
 
-    python3 batch-onboard-us915.py --list
-    python3 batch-onboard-us915.py --sp SP100280
-    python3 batch-onboard-us915.py --sp SP100207 SP100208 SP100209
-    python3 batch-onboard-us915.py --dry-run --sp SP100280
-    python3 batch-onboard-us915.py --by-address 22EBCF88-3C86-72DA-DE0B-48BD2443E654 --force
-    python3 batch-onboard-us915.py --scan-seconds 20 --force --region 3 --profile transit
+    ./batch-onboard.sh --list
+    ./batch-onboard.sh --sp SP100280
+    ./batch-onboard.sh --sp SP100207 SP100208 SP100209
+    ./batch-onboard.sh --dry-run --sp SP100280
+    ./batch-onboard.sh --by-address 22EBCF88-3C86-72DA-DE0B-48BD2443E654 --force
+    ./batch-onboard.sh --scan-seconds 20 --force --region 3 --profile transit
+
+Direct `python3 batch-onboard-us915.py ...` will refuse to run unless the
+project venv is active (or BUOY_VENV_BOOTSTRAPPED=1 is exported, e.g. in CI).
 
 LNS verification (post-flight)
 ------------------------------
@@ -77,6 +79,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+
+def _ensure_venv() -> None:
+    """Refuse to run outside the project venv with a one-line pointer to the wrapper.
+
+    The wrapper (batch-onboard.sh) sets BUOY_VENV_BOOTSTRAPPED=1 after it has
+    created/activated .venv and installed requirements. We also accept any
+    active venv (sys.prefix != sys.base_prefix) so power users who manually
+    `source .venv/bin/activate` aren't blocked.
+    """
+    if os.environ.get("BUOY_VENV_BOOTSTRAPPED") == "1":
+        return
+    if sys.prefix != sys.base_prefix:
+        return
+    wrapper = Path(__file__).with_name("batch-onboard.sh").name
+    fwd = " ".join(sys.argv[1:])
+    sys.stderr.write(
+        f"\nRun ./{wrapper} instead -- it sets up the .venv and installs\n"
+        "requirements (bleak, questionary) for you.\n\n"
+        f"    ./{wrapper}{(' ' + fwd) if fwd else ''}\n\n"
+        "(Set BUOY_VENV_BOOTSTRAPPED=1 to override, e.g. for CI.)\n"
+    )
+    sys.exit(1)
+
+
+_ensure_venv()
+
 try:
     from bleak import BleakClient, BleakScanner
     from bleak.backends.device import BLEDevice
@@ -84,7 +112,8 @@ try:
     from bleak.exc import BleakError
 except ImportError:
     sys.stderr.write(
-        "bleak is required. Install with: python3 -m pip install -r requirements.txt\n"
+        "bleak is required. Run ./batch-onboard.sh (it installs it) or\n"
+        "manually: python3 -m pip install -r requirements.txt\n"
     )
     sys.exit(1)
 
@@ -112,6 +141,8 @@ CMD_GET_SETTING = 0xA8
 CMD_SEND_ALL_SETTINGS = 0xA7  # device dumps every setting it knows
 CMD_JOIN = 0xA0   # trigger LoRa rejoin (re-init stack with current config)
 CMD_RESET = 0xA1  # full device reboot -- the only reliable way to force a real JR
+CMD_CLEAR_NVS = 0xAB  # wipe non-volatile storage (LoRaWAN session, JoinNonce/DevNonce, ...)
+CMD_RESET_LR = 0xB9  # reset the LR1110 radio chip only (clears modem RAM, app keeps running)
 CMD_SEND_STATUS_LR = 0xAD     # force a status uplink (battery, last-known position, etc.)
 CMD_GET_UBLOX_FIX = 0xB8      # trigger a fresh u-blox GPS fix and send the result over LoRa
 CMD_CONFIRM_PORT = 0x1F       # device replies on this port to confirm a command
@@ -149,6 +180,7 @@ INTER_DEVICE_PAUSE_SEC = 2.0    # CoreBluetooth grace between disconnect and nex
 BY_ADDRESS_LOOKUP_SEC = 10.0    # how long to scan for a specific address in --by-address mode
 INTER_SETTING_WRITE_SEC = 0.25  # pacing between profile setting writes (matches web app)
 DEFAULT_VERIFY_WAIT_MIN = 10    # minutes to wait before checking ChirpStack
+DEFAULT_ACTIVE_WITHIN_HOURS = 24.0  # skip only if lastSeenAt is within this window
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LEDGER_PATH = SCRIPT_DIR / "onboarded.json"
@@ -311,6 +343,17 @@ class Ledger:
 
     def count_ok(self) -> int:
         return sum(1 for e in self.data["devices"].values() if e.get("status") == "ok")
+
+    def mark_app_registered(self, dev_eui: str, registered: bool, at: Optional[str] = None) -> None:
+        """Stage 6 (ADR-0025 D6): record what this host learned or did about
+        the app registry. The ledger stays non-authoritative -- the app is."""
+        entry = dict(self.data["devices"].get(dev_eui, {}))
+        entry["app_registered"] = registered
+        if registered:
+            entry["app_registered_at"] = at or datetime.now(timezone.utc).isoformat()
+        else:
+            entry.pop("app_registered_at", None)
+        self.record(dev_eui, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +572,40 @@ class DeviceSession:
         await self._write(bytes([PORT_COMMANDS, CMD_RESET, 0x00]))
         await asyncio.sleep(0.3)
 
+    async def send_reset_lr(self) -> None:
+        """
+        Fire cmd_reset_lr (0xB9). Power-cycles the LR1110 radio chip only --
+        application code keeps running. Wipes the LR1110's internal RAM
+        (cached modem state, in-chip session machine), forcing the host MCU
+        to re-init the radio from scratch on the next LoRa operation.
+
+        Distinct from cmd_reset (0xA1) which reboots the entire device.
+        Useful diagnostic when a full reboot reloads the same bad state from
+        flash but the radio chip itself may have stale RAM contents.
+        """
+        await self._write(bytes([PORT_COMMANDS, CMD_RESET_LR, 0x00]))
+        await asyncio.sleep(0.3)
+
+    async def send_clear_nvs(self) -> None:
+        """
+        Fire cmd_clear_nvs (0xAB). Wipes the device's non-volatile storage,
+        which on Semtech LBM-based firmware includes the LoRaWAN session
+        state managed via NVMM callbacks: stored DevNonce / JoinNonce
+        counters, last devAddr, session keys, frame counters, etc.
+
+        This is the surgical fix for "stuck in JoinRequest <-> JoinAccept loop"
+        caused by the device's stored last-accepted JoinNonce being numerically
+        >= the JoinNonce ChirpStack issues in the next JoinAccept (which causes
+        the device to silently drop the JoinAccept per LoRaWAN replay-protection
+        rules).
+
+        WARNING: also likely clears persisted lr_region. Always re-write region
+        + profile BEFORE this command if you care about them, then follow with
+        cmd_reset (0xA1) so the cleared NVS is reloaded cleanly.
+        """
+        await self._write(bytes([PORT_COMMANDS, CMD_CLEAR_NVS, 0x00]))
+        await asyncio.sleep(0.5)  # NVS erase takes longer than a typical command
+
     async def send_get_ublox_fix(self) -> None:
         """
         Fire cmd_get_ublox_fix (0xB8). Tells the device to wake the u-blox GPS
@@ -560,6 +637,19 @@ async def _apply_post_action(
 
     Default is 'reboot' (cmd_reset). The script always reboots because the
     device's lr_joined flag is unreliable -- see module docstring.
+
+    Supported actions:
+      - 'none'              : no post-action
+      - 'rejoin'            : cmd_join (0xA0) -- light kick, often dropped
+      - 'reboot'            : cmd_reset (0xA1) -- full device reboot (default)
+      - 'reset-lr'          : cmd_reset_lr (0xB9) -- reset LR1110 radio chip only
+      - 'reset-lr+reboot'   : 0xB9 then 0xA1 (clear modem RAM AND reboot)
+      - 'clear-nvs+reboot'  : cmd_clear_nvs (0xAB) then cmd_reset (0xA1) --
+                              surgical fix for JoinNonce-replay loops; wipes
+                              persisted LoRaWAN session state on the device,
+                              then reboots so the cleared NVS reloads cleanly.
+                              Caller should write region/profile FIRST so the
+                              clear+reboot lands on the desired config.
     """
     if post_action == "none":
         return None
@@ -567,6 +657,20 @@ async def _apply_post_action(
         if post_action == "rejoin":
             print(f"  Sending cmd_join (0xA0) -- light kick (often a no-op)...")
             await session.send_join()
+        elif post_action == "reset-lr":
+            print(f"  Sending cmd_reset_lr (0xB9) -- reset LR1110 radio chip only...")
+            await session.send_reset_lr()
+        elif post_action == "reset-lr+reboot":
+            print(f"  Sending cmd_reset_lr (0xB9) -- reset LR1110 radio chip...")
+            await session.send_reset_lr()
+            print(f"  Sending cmd_reset (0xA1) -- full device reboot...")
+            await session.send_reset()
+        elif post_action == "clear-nvs+reboot":
+            print(f"  Sending cmd_clear_nvs (0xAB) -- wipe persisted LoRaWAN session "
+                  f"(JoinNonce, DevNonce, devAddr, keys)...")
+            await session.send_clear_nvs()
+            print(f"  Sending cmd_reset (0xA1) -- full device reboot to reload cleared NVS...")
+            await session.send_reset()
         else:  # 'reboot' (default)
             print(f"  Sending cmd_reset (0xA1) -- forces fresh OTAA join...")
             await session.send_reset()
@@ -583,7 +687,7 @@ async def _onboard_one_attempt(
     args: argparse.Namespace,
     target_region: Optional[int],
     target_profile: Optional[dict],
-    pre_run_addrs: dict[str, Optional[str]],
+    pre_run_addrs: dict[str, dict],
     target_dev_euis: Optional[set[str]] = None,
 ) -> tuple[str, Optional[str]]:
     """One onboarding attempt. Caller wraps this with retry + timeout."""
@@ -601,23 +705,43 @@ async def _onboard_one_attempt(
             return "not-targeted", dev_eui
 
         # Pre-flight skip rule:
-        #   1. If ChirpStack confirms the device is activated -> skip (don't
-        #      disturb a working session).
-        #   2. If ChirpStack was queried successfully but does NOT show this
-        #      device as activated -> process it, even if the ledger claims
-        #      we onboarded it before. The LNS is the authoritative source of
-        #      truth; a "ledger says ok" without an LNS activation just means
-        #      a previous run wrote the wrong settings (e.g. wrong region) or
-        #      the device's join never reached the network.
+        #   1. Skip only if ChirpStack shows both a devAddr (activated) AND a
+        #      recent data uplink (lastSeenAt within --active-within-hours).
+        #      A devAddr without a recent uplink is a "zombie activation" — the
+        #      JoinAccept was sent but never received by the device. These are
+        #      re-onboarded automatically without requiring --force.
+        #   2. If ChirpStack was queried but the device is NOT confirmed active
+        #      (no devAddr, or devAddr but no recent uplink) -> process it, even
+        #      if the ledger claims we onboarded it before.
         #   3. If we have NO LNS data (--no-verify, snapshot failed, etc.),
         #      fall back to the ledger as the only signal we have.
         # --force bypasses everything.
         if not args.force:
-            pre_addr = pre_run_addrs.get(dev_eui.upper())
-            if pre_addr:
-                print(f"  [SKIP] {dev_eui}: already activated on ChirpStack "
-                      f"(devAddr={pre_addr}). Use --force to re-onboard.")
+            snap = pre_run_addrs.get(dev_eui.upper()) or {}
+            pre_addr = snap.get("devaddr")
+            pre_last_seen = snap.get("last_seen_at")
+            max_hours: float = getattr(args, "active_within_hours", DEFAULT_ACTIVE_WITHIN_HOURS)
+
+            if pre_addr and _recently_active(pre_last_seen, max_hours):
+                print(f"  [SKIP] {dev_eui}: active on ChirpStack "
+                      f"(devAddr={pre_addr}, last uplink {_format_age(pre_last_seen)}). "
+                      f"Use --force to re-onboard.")
+                # Active on the LNS is not "onboarded" (ADR-0025 D1): the app
+                # must know it too, or it is uplinking into nothing.
+                app_state = app_registration_state(dev_eui, getattr(args, "app_url", DEFAULT_APP_URL))
+                if app_state == "unregistered":
+                    print(f"  [WARN] {dev_eui}: joined on ChirpStack but NOT IN APP -- "
+                          f"invisible to every customer. Register it: "
+                          f"--register-app --org <id|name> --dev-eui {dev_eui}")
+                elif app_state == "unknown":
+                    print(f"  [WARN] {dev_eui}: app registry could not be checked (status UNKNOWN).")
                 return "skipped-joined", dev_eui
+
+            if pre_addr and not _recently_active(pre_last_seen, max_hours):
+                # Zombie activation: devAddr assigned but no data uplink received.
+                print(f"  Note: ChirpStack shows devAddr={pre_addr} but last uplink "
+                      f"{_format_age(pre_last_seen)} (>{max_hours:.0f}h threshold). "
+                      f"Treating as zombie activation — re-onboarding.")
 
             if not pre_run_addrs:
                 # Case 3: no LNS truth available, fall back to ledger.
@@ -625,7 +749,7 @@ async def _onboard_one_attempt(
                     print(f"  [SKIP] {dev_eui}: already onboarded in ledger "
                           f"(no LNS data this run; use --force to re-run)")
                     return "skipped", dev_eui
-            elif ledger.already_done(dev_eui):
+            elif not pre_addr and ledger.already_done(dev_eui):
                 # Case 2: LNS says not activated, but ledger says we did it.
                 # Ledger is stale -- proceed with re-onboarding.
                 print(f"  Note: ledger marks this device onboarded, but ChirpStack "
@@ -700,7 +824,7 @@ async def onboard_one(
     args: argparse.Namespace,
     target_region: Optional[int],
     target_profile: Optional[dict],
-    pre_run_addrs: dict[str, Optional[str]],
+    pre_run_addrs: dict[str, dict],
     target_dev_euis: Optional[set[str]] = None,
 ) -> tuple[str, Optional[str]]:
     """
@@ -1043,6 +1167,141 @@ def _http_get_json(url: str, api_key: str, timeout: float = 15.0) -> Optional[di
         return None
 
 
+# ---------------------------------------------------------------------------
+# App registry (ADR-0025 stage 1): the third registry, checked unconditionally
+# ---------------------------------------------------------------------------
+
+DEFAULT_APP_URL = "https://app.buoy.fish"
+
+
+def _app_fetch_json(url: str, timeout: float = 15.0) -> dict:
+    """GET a public app endpoint; raises urllib.error.HTTPError on non-2xx."""
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "batch-onboard-us915/1.0 (+buoy-fish/devices)",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def app_registration_state(dev_eui: str, app_url: str, fetch=_app_fetch_json) -> str:
+    """
+    Tri-state answer from the app's public, unauthenticated registry lookup:
+      'registered'   -> GET /api/devices/lookup/<eui> was 200
+      'unregistered' -> 404
+      'unknown'      -> anything else (5xx, DNS, timeout)
+    'unknown' is never folded into 'unregistered': an app blip must read as
+    "could not check", not as a fleet of unregistered devices.
+    """
+    url = f"{app_url.rstrip('/')}/api/devices/lookup/{dev_eui.upper()}"
+    try:
+        fetch(url, timeout=15.0)
+        return "registered"
+    except urllib.error.HTTPError as e:
+        return "unregistered" if e.code == 404 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def joined_but_not_in_app(
+    states: dict[str, str],
+    activations: dict[str, Optional[str]],
+    sp_by_eui: dict[str, str],
+    names_by_eui: dict[str, Optional[str]],
+) -> list[tuple[str, str, str]]:
+    """
+    Devices the LNS has joined (an activation exists) that the app registry
+    answers 404 for. Two-of-three is a failure to surface (ADR-0025 D1).
+    'unknown' answers are NOT orphans -- they are "could not check" and are
+    reported separately by format_app_registry_section.
+    Returns sorted (sp, dev_eui, chirpstack_name) rows.
+    """
+    rows = []
+    for eui, state in states.items():
+        if state != "unregistered" or not activations.get(eui):
+            continue
+        rows.append((sp_by_eui.get(eui, "?"), eui, names_by_eui.get(eui) or ""))
+    return sorted(rows)
+
+
+def format_app_registry_section(rows: list[tuple[str, str, str]], unknown: list[str]) -> str:
+    """The post-flight report section for the app registry. Empty when all
+    three registries agree."""
+    if not rows and not unknown:
+        return ""
+    lines = []
+    if rows:
+        lines.append(f"\n=== JOINED BUT NOT IN APP ({len(rows)}) ===")
+        lines.append("  On the network, invisible to every customer, uplinking into")
+        lines.append("  unattached history (ADR-0025). Register them -- never inferred:")
+        lines.append("    ./batch-onboard.sh --register-app --org <id|name> --dev-eui <EUI...>")
+        for sp, eui, name in rows:
+            lines.append(f"    {sp:<10} {eui}  {name}")
+    if unknown:
+        lines.append(f"\n  App registry could not be checked ({len(unknown)}) -- status UNKNOWN, not clean:")
+        for eui in sorted(unknown):
+            lines.append(f"    {eui}")
+    return "\n".join(lines)
+
+
+def _app_post_json(url: str, body: dict, headers: dict, timeout: float = 15.0) -> tuple[int, dict]:
+    """POST JSON; returns (status, parsed body) for any HTTP status."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "batch-onboard-us915/1.0 (+buoy-fish/devices)",
+        **headers,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {}
+
+
+def register_device_in_app(
+    dev_eui: str,
+    name: str,
+    org: str,
+    *,
+    app_url: str,
+    token: str,
+    device_type: str = "buoy",
+    post=_app_post_json,
+) -> tuple[str, str, Optional[str]]:
+    """
+    Stage 3: register one LNS-joined device in the app through the internal
+    machine endpoint (ADR-0025 D4). `org` is an organization id (digits) or an
+    exact organization name -- whatever the operator passed; never inferred.
+    device_id is never sent: the app derives it from the EUI so stored
+    history is adopted (D3).
+
+    Returns ('registered', device_id, last_ping) | ('already_registered', device_id, None)
+          | ('failed', reason, None)
+    """
+    body: dict = {"dev_eui": dev_eui.upper(), "name": name, "device_type": device_type}
+    if org.strip().isdigit():
+        body["organization_id"] = int(org)
+    else:
+        body["organization_name"] = org
+    status, payload = post(
+        f"{app_url.rstrip('/')}/api/internal/devices/register",
+        body,
+        {"X-Mappers-Admin-Token": token},
+        timeout=15.0,
+    )
+    data = payload.get("data") or {}
+    if status == 201:
+        return "registered", data.get("device_id", ""), data.get("last_ping")
+    if status == 409:
+        return "already_registered", data.get("device_id", ""), None
+    return "failed", f"HTTP {status}: {json.dumps(payload)[:200]}", None
+
+
 def query_activation_full(lns_cfg: dict, dev_eui: str) -> dict:
     """
     Returns {'devaddr': str|None, 'fcnt_up': int|None}. Empty dict on error.
@@ -1096,23 +1355,106 @@ async def snapshot_activations_full(lns_cfg: dict, dev_euis: list[str]) -> dict[
     return out
 
 
-async def list_app_dev_euis(lns_cfg: dict) -> list[str]:
-    """Return all DevEUIs in the application (one paged GET)."""
+def _parse_chirpstack_ts(ts: Optional[str]) -> Optional[datetime]:
+    """Parse a ChirpStack RFC3339 timestamp into a timezone-aware datetime, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _recently_active(last_seen_at: Optional[str], max_hours: float) -> bool:
+    """Return True if last_seen_at is a data-uplink timestamp within max_hours of now."""
+    dt = _parse_chirpstack_ts(last_seen_at)
+    if dt is None:
+        return False
+    return (datetime.now(timezone.utc) - dt).total_seconds() < max_hours * 3600
+
+
+def _format_age(last_seen_at: Optional[str]) -> str:
+    """Return a human-readable age string like '3h 12m ago' or 'never'."""
+    dt = _parse_chirpstack_ts(last_seen_at)
+    if dt is None:
+        return "never"
+    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if secs < 0:
+        return "in the future?"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    hours, mins = divmod(secs // 60, 60)
+    if hours < 48:
+        return f"{hours}h {mins}m ago" if mins else f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+async def list_app_dev_euis(lns_cfg: dict) -> tuple[list[str], dict[str, Optional[str]]]:
+    """Return (all DevEUIs in app, {devEui_upper: lastSeenAt_or_None}).
+
+    lastSeenAt is populated by ChirpStack only when the device has sent at least
+    one data uplink. It is null for devices that joined but never sent uplinks
+    (zombie activations) and for unjoined devices.
+    """
+    euis, last_seen, _names = await list_app_devices_full(lns_cfg)
+    return euis, last_seen
+
+
+async def list_app_devices_full(
+    lns_cfg: dict,
+) -> tuple[list[str], dict[str, Optional[str]], dict[str, Optional[str]]]:
+    """Return (DevEUIs, {eui: lastSeenAt}, {eui: ChirpStack device name})."""
     url = (f"{lns_cfg['base_url'].rstrip('/')}/api/devices"
            f"?applicationId={lns_cfg['app_id']}&limit=1000")
     data = _http_get_json(url, lns_cfg["api_key"], timeout=20.0)
     if not data:
-        return []
-    return [d["devEui"].upper() for d in data.get("result", [])]
+        return [], {}, {}
+    euis: list[str] = []
+    last_seen: dict[str, Optional[str]] = {}
+    names: dict[str, Optional[str]] = {}
+    for d in data.get("result", []):
+        eui = d["devEui"].upper()
+        euis.append(eui)
+        last_seen[eui] = d.get("lastSeenAt") or None
+        names[eui] = d.get("name") or None
+    return euis, last_seen, names
+
+
+async def build_pre_run_snapshot(lns_cfg: dict) -> dict[str, dict]:
+    """
+    Fetch the combined pre-run snapshot in two API calls:
+      1. GET /api/devices  → DevEUI list + lastSeenAt per device
+      2. GET /api/devices/{devEui}/activation (parallel) → devAddr per device
+
+    Returns {devEui_upper: {"devaddr": str|None, "last_seen_at": str|None}}.
+
+    lastSeenAt is null until the device sends its first data uplink, making it a
+    reliable indicator of a truly working session vs a zombie activation (ChirpStack
+    sent a JoinAccept that the device never received).
+    """
+    app_euis, last_seen_map = await list_app_dev_euis(lns_cfg)
+    if not app_euis:
+        return {}
+    activation_map = await snapshot_activations(lns_cfg, app_euis)
+    return {
+        eui: {
+            "devaddr": activation_map.get(eui),
+            "last_seen_at": last_seen_map.get(eui),
+        }
+        for eui in app_euis
+    }
 
 
 async def verify_joins(
     lns_cfg: dict,
     ledger: Ledger,
     run_devices: list[str],
-    pre_run_addrs: dict[str, Optional[str]],
+    pre_run_addrs: dict[str, dict],
     wait_min: int,
-) -> None:
+    app_url: str = DEFAULT_APP_URL,
+) -> list[tuple[str, str, str]]:
     """
     Wait `wait_min` minutes, then query ChirpStack activation for each
     touched device and compare against the pre-run snapshot.
@@ -1123,13 +1465,13 @@ async def verify_joins(
       - ALREADY JOINED:         activation before, devAddr unchanged (no fresh JR observed)
       - NOT JOINED:             no activation now (regardless of before)
 
-    `lastSeenAt` is intentionally NOT used: it does not update on JoinRequest
+    `lastSeenAt` is intentionally NOT used here: it does not update on JoinRequest
     in ChirpStack v4, only on data uplinks, which can be hours away on a
     freshly-joined device.
     """
     if not run_devices:
         print("\nNo devices to verify (none touched this run).")
-        return
+        return []
 
     print(f"\nWaiting {wait_min} min for {len(run_devices)} device(s) to join, "
           f"then checking ChirpStack at {lns_cfg['base_url']}...")
@@ -1151,7 +1493,7 @@ async def verify_joins(
     for dev_eui in run_devices:
         entry = ledger.data["devices"].get(dev_eui, {})
         sp = entry.get("ble_name", "?")
-        before = pre_run_addrs.get(dev_eui.upper())
+        before = (pre_run_addrs.get(dev_eui.upper()) or {}).get("devaddr")
         after = post_run_addrs.get(dev_eui.upper())
         if not after:
             not_joined.append((sp, dev_eui))
@@ -1192,6 +1534,183 @@ async def verify_joins(
         print("\n  Hints: confirm the device is registered in ChirpStack; check "
               "gateway coverage; re-run with --force.")
 
+    # Stage 1 (ADR-0025): the THIRD registry. Always on, no credentials, read
+    # only. A device that joined the LNS but the app has never heard of is
+    # invisible to every customer -- two of three registries is a failure.
+    print(f"\nChecking the app registry at {app_url} for {len(run_devices)} device(s)...")
+    states = {eui: app_registration_state(eui, app_url) for eui in run_devices}
+    names_by_eui: dict[str, Optional[str]] = {}
+    try:
+        _, _, names_by_eui = await list_app_devices_full(lns_cfg)
+    except Exception:
+        pass
+    sp_by_eui = {eui: ledger.data["devices"].get(eui, {}).get("ble_name", "?") for eui in run_devices}
+    for eui, state in states.items():
+        if state != "unknown":
+            ledger.mark_app_registered(eui, state == "registered")
+    rows = joined_but_not_in_app(states, post_run_addrs, sp_by_eui, names_by_eui)
+    unknown = sorted(eui for eui, st in states.items() if st == "unknown")
+    registered = sum(1 for st in states.values() if st == "registered")
+    print(f"  IN APP:                 {registered}/{len(run_devices)}")
+    section = format_app_registry_section(rows, unknown)
+    if section:
+        print(section)
+    return rows
+
+
+def register_gaps_in_app(rows: list[tuple[str, str, str]], ledger: Ledger, args: argparse.Namespace) -> None:
+    """Stage 3: --register-app. Only devices that are LNS-joined AND app-404
+    (the rows verify_joins reported), only into the org the operator named."""
+    if not rows:
+        print("\n--register-app: nothing to register (every joined device is in the app).")
+        return
+    token = load_app_token(args)
+    if not token:
+        print("\n[ERROR] --register-app needs BUOY_MAPPERS_ADMIN_TOKEN (in ./.env or the environment). "
+              "Nothing registered.")
+        return
+    print(f"\nRegistering {len(rows)} device(s) in the app under organization '{args.org}'...")
+    for sp, eui, name in rows:
+        outcome, detail, last_ping = register_device_in_app(
+            eui, name or sp, args.org, app_url=args.app_url, token=token,
+            device_type=args.device_type)
+        if outcome == "registered":
+            ledger.mark_app_registered(eui, True)
+            history = f", history adopted (last_ping {last_ping})" if last_ping else ""
+            print(f"  {sp:<10} {eui}  REGISTERED device_id={detail}{history}")
+        elif outcome == "already_registered":
+            ledger.mark_app_registered(eui, True)
+            print(f"  {sp:<10} {eui}  already registered (device_id={detail})")
+        else:
+            print(f"  {sp:<10} {eui}  FAILED: {detail}")
+
+
+def load_app_token(args: argparse.Namespace) -> Optional[str]:
+    """BUOY_MAPPERS_ADMIN_TOKEN from ./.env (or --lns-env) or the environment."""
+    env_path = Path(args.lns_env) if getattr(args, "lns_env", None) else LOCAL_ENV_PATH
+    env = load_env_file(env_path) if env_path.exists() else {}
+    return env.get("BUOY_MAPPERS_ADMIN_TOKEN") or os.environ.get("BUOY_MAPPERS_ADMIN_TOKEN")
+
+
+# ---------------------------------------------------------------------------
+# Diagnose-stuck mode: identify devices in the JoinRequest <-> JoinAccept loop
+# ---------------------------------------------------------------------------
+
+_SP_RE = __import__("re").compile(r"\bSP\d{6}\b", __import__("re").IGNORECASE)
+
+
+def _extract_sp_from_name(name: Optional[str]) -> Optional[str]:
+    """Find an SPNNNNNN token inside a ChirpStack device name (anywhere in the string)."""
+    if not name:
+        return None
+    m = _SP_RE.search(name)
+    return m.group(0).upper() if m else None
+
+
+async def diagnose_stuck(args: argparse.Namespace) -> int:
+    """
+    Read-only ChirpStack query. Identify devices stuck in the
+    JoinRequest -> JoinAccept loop (devAddr present, no recent data uplink).
+    Print a copy-paste-ready --sp line and an SQL line for the JoinNonce fix.
+    """
+    lns_cfg: Optional[dict] = getattr(args, "_lns_cfg", None)
+    if not lns_cfg:
+        print("[FAIL] No ChirpStack credentials available.")
+        return 1
+
+    max_hours: float = getattr(args, "active_within_hours", DEFAULT_ACTIVE_WITHIN_HOURS)
+    print(f"Querying ChirpStack at {lns_cfg['base_url']}...")
+    try:
+        euis, last_seen_map, name_map = await list_app_devices_full(lns_cfg)
+    except Exception as e:
+        print(f"[FAIL] List devices failed: {type(e).__name__}: {e}")
+        return 1
+    if not euis:
+        print("[FAIL] No devices found in application.")
+        return 1
+    print(f"  {len(euis)} devices in app. Querying activations...")
+    try:
+        activation_map = await snapshot_activations(lns_cfg, euis)
+    except Exception as e:
+        print(f"[FAIL] Activation snapshot failed: {type(e).__name__}: {e}")
+        return 1
+
+    ledger = Ledger(LEDGER_PATH)
+    ledger_sp_by_eui: dict[str, str] = {}
+    for eui, entry in ledger.data.get("devices", {}).items():
+        ble_name = entry.get("ble_name") or ""
+        sp = _extract_sp_from_name(ble_name)
+        if sp:
+            ledger_sp_by_eui[eui.upper()] = sp
+
+    # Categorize every device
+    stuck: list[tuple[str, str, str, Optional[str]]] = []   # (sp, eui, devaddr, last_seen_at)
+    never_joined: list[tuple[str, str]] = []                # (sp, eui) -- no devAddr ever
+    active: list[tuple[str, str, str, Optional[str]]] = []  # (sp, eui, devaddr, last_seen_at)
+    for eui in euis:
+        devaddr = activation_map.get(eui)
+        last_seen = last_seen_map.get(eui)
+        sp = (ledger_sp_by_eui.get(eui)
+              or _extract_sp_from_name(name_map.get(eui))
+              or "?")
+        if devaddr and _recently_active(last_seen, max_hours):
+            active.append((sp, eui, devaddr, last_seen))
+        elif devaddr:
+            stuck.append((sp, eui, devaddr, last_seen))
+        else:
+            never_joined.append((sp, eui))
+
+    print()
+    print("=" * 64)
+    print(f"ChirpStack diagnostic — {len(euis)} devices in app")
+    print("=" * 64)
+    print(f"  Active (devAddr + uplink <{max_hours:.0f}h):   {len(active)}")
+    print(f"  STUCK in join-loop (devAddr, no uplink): {len(stuck)}")
+    print(f"  Never joined (no devAddr):               {len(never_joined)}")
+
+    if stuck:
+        print(f"\n--- STUCK DEVICES ({len(stuck)}) -- in JoinReq <-> JoinAccept loop ---")
+        print(f"  These have an assigned devAddr but no data uplink within "
+              f"{max_hours:.0f}h.\n  Most likely cause: JoinNonce replay (device's stored JoinNonce > "
+              f"\n  ChirpStack's stored join_nonce, so the device silently drops every JoinAccept).\n")
+        print(f"  {'SP#':<10} {'DevEUI':<18} {'devAddr':<10} last data uplink")
+        print(f"  {'-'*10} {'-'*16:<18} {'-'*8:<10} {'-'*20}")
+        for sp, eui, devaddr, last_seen in sorted(stuck):
+            print(f"  {sp:<10} {eui:<18} {devaddr:<10} {_format_age(last_seen)}")
+
+        sps_with_label = sorted({sp for sp, _, _, _ in stuck if sp != "?"})
+        unknown = [eui for sp, eui, _, _ in stuck if sp == "?"]
+
+        print(f"\n--- COPY-PASTE: re-onboard with --force ({len(sps_with_label)} SP#s) ---")
+        if sps_with_label:
+            print(f"./batch-onboard.sh --force --region US915 --profile hourly \\")
+            print(f"  --sp {' '.join(sps_with_label)}")
+        if unknown:
+            print(f"\n  ({len(unknown)} stuck device(s) have no SP# in the local ledger; "
+                  f"target by DevEUI:)")
+            print(f"  --dev-eui {' '.join(unknown)}")
+
+        print(f"\n--- COPY-PASTE: ChirpStack JoinNonce fix (run on console.buoy.fish) ---")
+        print(f"  If --force alone does not fix these, the JoinAccept's JoinNonce is")
+        print(f"  numerically <= what the device has stored in NVS. Bump it past any")
+        print(f"  plausible stored value with this SQL:\n")
+        eui_list = ",".join(f"decode('{eui.lower()}','hex')" for _, eui, _, _ in sorted(stuck))
+        print(f"  docker exec -i $(docker ps -qf name=postgres) \\")
+        print(f"    psql -U chirpstack -d chirpstack -c \"")
+        print(f"    UPDATE device SET join_nonce = 1000000")
+        print(f"    WHERE dev_eui = ANY(ARRAY[{eui_list}]);\"")
+        print(f"\n  Then re-run the --force command above. The next JoinAccept will")
+        print(f"  carry JoinNonce=1000001, guaranteed > whatever the device has.")
+
+    if never_joined:
+        print(f"\n--- NEVER JOINED ({len(never_joined)}) -- need an OTAA join ---")
+        for sp, eui in sorted(never_joined)[:30]:
+            print(f"  {sp:<10} {eui}")
+        if len(never_joined) > 30:
+            print(f"  ... and {len(never_joined) - 30} more.")
+
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # Main run loop
@@ -1212,32 +1731,66 @@ async def run(args: argparse.Namespace) -> int:
         print("DRY RUN -- will identify devices but not write or reboot.")
 
     sp_filter: Optional[set[str]] = set(args.sp) if args.sp else None
+    dev_eui_filter: Optional[set[str]] = set(args.dev_eui) if args.dev_eui else None
+
+    # If the user passed --dev-eui, look each one up in the ledger and auto-add
+    # the corresponding SP# to the pre-connect scan filter. This avoids
+    # connecting to every IRNAS device in range just to read its DevEUI.
+    # DevEUI is not visible in BLE advertisements, only post-connect.
+    if dev_eui_filter:
+        sp_from_eui: set[str] = set()
+        unresolved: list[str] = []
+        for eui in dev_eui_filter:
+            entry = ledger.data.get("devices", {}).get(eui)
+            ble_name = (entry or {}).get("ble_name") if entry else None
+            if ble_name:
+                sp_from_eui.add(ble_name.upper())
+            else:
+                unresolved.append(eui)
+        if sp_from_eui:
+            sp_filter = (sp_filter or set()) | sp_from_eui
+            print(f"DevEUI -> SP# resolution: {len(sp_from_eui)} resolved from ledger.")
+        if unresolved:
+            print(f"  [WARN] {len(unresolved)} DevEUI(s) not in ledger -- "
+                  f"falling back to scanning all devices for these:")
+            for eui in unresolved[:10]:
+                print(f"    - {eui}")
+            if len(unresolved) > 10:
+                print(f"    ... and {len(unresolved) - 10} more.")
+            # If even one DevEUI couldn't be resolved, we have to scan unfiltered
+            # so we don't miss it (it might be a never-onboarded device).
+            sp_filter = None
+
     if sp_filter:
         print(f"SP filter: {len(sp_filter)} SP number(s).")
         if len(sp_filter) <= 20:
             for sp in sorted(sp_filter):
                 print(f"  - {sp}")
 
-    dev_eui_filter: Optional[set[str]] = set(args.dev_eui) if args.dev_eui else None
     if dev_eui_filter:
         print(f"DevEUI validation (post-connect): {len(dev_eui_filter)} DevEUI(s)")
 
     if sp_filter is None and dev_eui_filter is None and not getattr(args, "_wizard_confirmed", False):
         print("[WARN] No --sp or --dev-eui filter set. Will attempt every IRNAS device in range.")
 
-    # Pre-run activation snapshot: capture each app device's current devAddr (if any)
-    # so we can later distinguish "joined this run" (new/changed devAddr) from
-    # "already joined before" (devAddr unchanged) from "did not join" (still no devAddr).
-    pre_run_addrs: dict[str, Optional[str]] = {}
+    # Pre-run snapshot: capture devAddr (activated?) and lastSeenAt (data uplink received?)
+    # for every device in the application.  Both fields are required to distinguish:
+    #   - truly active (devAddr + recent uplink) → skip
+    #   - zombie activation (devAddr but no/stale uplink) → re-onboard without --force
+    #   - not joined (no devAddr) → onboard
+    max_hours: float = getattr(args, "active_within_hours", DEFAULT_ACTIVE_WITHIN_HOURS)
+    pre_run_addrs: dict[str, dict] = {}
     lns_cfg: Optional[dict] = getattr(args, "_lns_cfg", None)
     if not args.no_verify and lns_cfg and not args.dry_run:
         print(f"\nCapturing pre-run activation snapshot from ChirpStack...")
         try:
-            app_euis = await list_app_dev_euis(lns_cfg)
-            if app_euis:
-                pre_run_addrs = await snapshot_activations(lns_cfg, app_euis)
-                joined_now = sum(1 for v in pre_run_addrs.values() if v)
-                print(f"  Snapshot: {len(app_euis)} devices in app, {joined_now} currently activated.")
+            pre_run_addrs = await build_pre_run_snapshot(lns_cfg)
+            if pre_run_addrs:
+                activated = sum(1 for v in pre_run_addrs.values() if v.get("devaddr"))
+                active = sum(1 for v in pre_run_addrs.values()
+                             if _recently_active(v.get("last_seen_at"), max_hours))
+                print(f"  Snapshot: {len(pre_run_addrs)} devices in app, "
+                      f"{activated} activated, {active} with uplink <{max_hours:.0f}h.")
             else:
                 print("  [WARN] No devices found in application; verification will treat all as new joins.")
         except Exception as e:
@@ -1355,7 +1908,10 @@ async def run(args: argparse.Namespace) -> int:
 
     # Post-flight ChirpStack verification
     if not args.no_verify and lns_cfg and devices_touched and not args.dry_run:
-        await verify_joins(lns_cfg, ledger, devices_touched, pre_run_addrs, args.verify_wait_min)
+        gaps = await verify_joins(lns_cfg, ledger, devices_touched, pre_run_addrs,
+                                  args.verify_wait_min, app_url=args.app_url)
+        if args.register_app:
+            register_gaps_in_app(gaps, ledger, args)
     elif not args.no_verify and devices_touched and not args.dry_run:
         print("\n[INFO] Skipping ChirpStack verification (no LNS config). "
               "Use check-onboarded-status.py later to verify joins.")
@@ -1376,12 +1932,10 @@ async def run_by_address(args: argparse.Namespace) -> int:
 
     # Pre-snapshot the entire app's activations BEFORE we touch the device,
     # so verification can distinguish new joins from existing activations.
-    pre_run_addrs: dict[str, Optional[str]] = {}
+    pre_run_addrs: dict[str, dict] = {}
     if not args.no_verify and lns_cfg and not args.dry_run:
         try:
-            app_euis = await list_app_dev_euis(lns_cfg)
-            if app_euis:
-                pre_run_addrs = await snapshot_activations(lns_cfg, app_euis)
+            pre_run_addrs = await build_pre_run_snapshot(lns_cfg)
         except Exception as e:
             print(f"[WARN] Pre-run snapshot failed: {type(e).__name__}: {e}")
 
@@ -1400,7 +1954,10 @@ async def run_by_address(args: argparse.Namespace) -> int:
     print(f"\nOutcome: {outcome}")
 
     if outcome == "onboarded" and dev_eui and lns_cfg and not args.no_verify and not args.dry_run:
-        await verify_joins(lns_cfg, ledger, [dev_eui], pre_run_addrs, args.verify_wait_min)
+        gaps = await verify_joins(lns_cfg, ledger, [dev_eui], pre_run_addrs,
+                                  args.verify_wait_min, app_url=args.app_url)
+        if args.register_app:
+            register_gaps_in_app(gaps, ledger, args)
 
     return 0 if outcome != "failed" else 1
 
@@ -1892,16 +2449,15 @@ async def run_report(args: argparse.Namespace) -> int:
     print(f"[report] schema: {schema_msg}")
 
     lns_cfg: Optional[dict] = getattr(args, "_lns_cfg", None)
-    pre_run_addrs: dict[str, Optional[str]] = {}
+    pre_run_addrs: dict[str, dict] = {}
     app_devices: set[str] = set()
     if lns_cfg and not args.no_verify:
         try:
             print(f"[report] querying ChirpStack at {lns_cfg['base_url']}...")
-            app_euis = await list_app_dev_euis(lns_cfg)
-            app_devices = {e.upper() for e in app_euis}
-            pre_run_addrs = await snapshot_activations(lns_cfg, app_euis) if app_euis else {}
-            print(f"[report] {len(app_devices)} devices in app, "
-                  f"{sum(1 for v in pre_run_addrs.values() if v)} activated")
+            pre_run_addrs = await build_pre_run_snapshot(lns_cfg)
+            app_devices = set(pre_run_addrs.keys())
+            activated = sum(1 for v in pre_run_addrs.values() if v.get("devaddr"))
+            print(f"[report] {len(app_devices)} devices in app, {activated} activated")
         except Exception as e:
             print(f"[report] [WARN] LNS query failed: {type(e).__name__}: {e}")
 
@@ -1969,9 +2525,11 @@ async def run_report(args: argparse.Namespace) -> int:
                         # notification on connect; pull it from the rx buffer.
                         last_position = _extract_last_position(session.rx_buffer)
 
+                        _cs_snap = pre_run_addrs.get(dev_eui.upper()) or {}
                         cs_status = {"queried": bool(lns_cfg and not args.no_verify),
                                      "registered": dev_eui.upper() in app_devices,
-                                     "devaddr": pre_run_addrs.get(dev_eui.upper()),
+                                     "devaddr": _cs_snap.get("devaddr"),
+                                     "last_seen_at": _cs_snap.get("last_seen_at"),
                                      "fcnt_up": None}
 
                         record = {
@@ -2080,7 +2638,7 @@ async def run_locate(args: argparse.Namespace) -> int:
     if lns_cfg and not args.no_verify:
         try:
             print(f"\nCapturing pre-locate fCntUp baseline from ChirpStack...")
-            app_euis = await list_app_dev_euis(lns_cfg)
+            app_euis, _ = await list_app_dev_euis(lns_cfg)
             if app_euis:
                 pre_fcnt = await snapshot_activations_full(lns_cfg, app_euis)
                 joined = sum(1 for v in pre_fcnt.values() if v["devaddr"])
@@ -2278,7 +2836,7 @@ async def _verify_locate_uplinks(
 
 def _is_wizard_invocation(args: argparse.Namespace) -> bool:
     """True if the user ran the script bare (no relevant flags) -> launch wizard."""
-    if args.list_mode or args.by_address or args.report or args.locate:
+    if args.list_mode or args.by_address or args.report or args.locate or args.diagnose_stuck:
         return False
     if args.sp or args.dev_eui:
         return False
@@ -2316,7 +2874,12 @@ def main() -> int:
     parser.add_argument("--sp", nargs="+", type=normalize_sp, metavar="SP#",
                         help="One or more SP numbers (e.g. SP100280). Pre-connect filter on adv name.")
     parser.add_argument("--dev-eui", nargs="+", type=normalize_dev_eui, metavar="HEX",
-                        help="Optional post-connect DevEUI validation (16 hex chars).")
+                        help="One or more 16-hex-char DevEUIs. Each is looked up in the local "
+                             "ledger to resolve its SP#, which is added to the pre-connect scan "
+                             "filter (efficient: only connects to the targeted devices). DevEUIs "
+                             "not in the ledger fall back to post-connect validation, which "
+                             "requires connecting to every IRNAS device in range. Can be combined "
+                             "with --sp.")
     parser.add_argument("--force", action="store_true",
                         help="Bypass BOTH skips: re-onboard devices that are already "
                              "activated on ChirpStack AND devices already in the local ledger.")
@@ -2337,6 +2900,11 @@ def main() -> int:
                         help="Read-only mode: connect to every IRNAS device in range, dump "
                              "all settings + ChirpStack activation status to ./reports/, do not "
                              "write or reboot. Useful for QA snapshots and audits.")
+    parser.add_argument("--diagnose-stuck", action="store_true", dest="diagnose_stuck",
+                        help="Read-only ChirpStack query. Identify devices stuck in the "
+                             "JoinRequest <-> JoinAccept loop (have devAddr but no recent "
+                             "data uplink). Prints copy-paste-ready --sp targets and a SQL "
+                             "snippet to fix JoinNonce replay.")
     parser.add_argument("--locate", action="store_true",
                         help="Locate mode: for every IRNAS device in BLE range, trigger "
                              "cmd_get_ublox_fix (0xB8) to acquire a fresh GPS fix and uplink it. "
@@ -2362,6 +2930,29 @@ def main() -> int:
                                  "almost always what you want.")
     post_group.add_argument("--reboot", dest="post_action", action="store_const", const="reboot",
                             help="Send cmd_reset (0xA1). This is the default.")
+    post_group.add_argument("--reset-lr", dest="post_action", action="store_const", const="reset-lr",
+                            help="DIAGNOSTIC. Send cmd_reset_lr (0xB9) instead of cmd_reset. "
+                                 "Power-cycles the LR1110 radio chip only -- application code "
+                                 "keeps running. Wipes the LR1110's internal RAM and forces a "
+                                 "fresh radio init, which can break devices stuck in a "
+                                 "JoinRequest <-> JoinAccept loop where a full reboot reloads "
+                                 "the same bad state from flash.")
+    post_group.add_argument("--reset-lr-then-reboot", dest="post_action",
+                            action="store_const", const="reset-lr+reboot",
+                            help="Send cmd_reset_lr (0xB9) followed by cmd_reset (0xA1). "
+                                 "Maximum reset: clears LR1110 RAM and then reboots the MCU. "
+                                 "Use when neither --reboot nor --reset-lr alone has triggered "
+                                 "a successful join.")
+    post_group.add_argument("--clear-nvs-then-reboot", dest="post_action",
+                            action="store_const", const="clear-nvs+reboot",
+                            help="Send cmd_clear_nvs (0xAB) then cmd_reset (0xA1). NUCLEAR "
+                                 "OPTION for devices stuck in a JoinRequest <-> JoinAccept loop: "
+                                 "wipes the device's persisted LoRaWAN session state (JoinNonce, "
+                                 "DevNonce, devAddr, session keys), then reboots so the device "
+                                 "rejoins from a truly clean slate. The script writes "
+                                 "region/profile/init_time BEFORE this action, so those persist. "
+                                 "WARNING: do not combine with --no-set-time or skip --region "
+                                 "if you depend on those settings -- they may also be wiped.")
     parser.set_defaults(post_action="reboot")
 
     parser.add_argument("--lns-url", default=None, help="Override CHIRPSTACK_BASE_URL.")
@@ -2374,10 +2965,33 @@ def main() -> int:
     parser.add_argument("--verify-wait-min", type=int, default=DEFAULT_VERIFY_WAIT_MIN,
                         help=f"Minutes to wait after the last reboot before checking ChirpStack "
                              f"(default: {DEFAULT_VERIFY_WAIT_MIN}).")
+    parser.add_argument("--active-within-hours", type=float, default=DEFAULT_ACTIVE_WITHIN_HOURS,
+                        metavar="H",
+                        help=f"A device is considered 'active' (and skipped) only if ChirpStack "
+                             f"shows both a devAddr AND a data uplink (lastSeenAt) within this "
+                             f"many hours. Devices with a devAddr but no recent uplink are "
+                             f"treated as zombie activations and re-onboarded automatically "
+                             f"without --force. Default: {DEFAULT_ACTIVE_WITHIN_HOURS:.0f}h. "
+                             f"Set to 0 to treat any devAddr as active (old behaviour).")
+    parser.add_argument("--app-url", default=os.environ.get("BUOY_APP_URL", DEFAULT_APP_URL),
+                        help="App registry base URL for the always-on lookup and --register-app "
+                             f"(default {DEFAULT_APP_URL}).")
+    parser.add_argument("--register-app", action="store_true",
+                        help="After verification, register devices that are LNS-joined but absent "
+                             "from the app, into --org. Needs BUOY_MAPPERS_ADMIN_TOKEN in ./.env.")
+    parser.add_argument("--org", default=None, metavar="ID|NAME",
+                        help="Organization to register into (id or exact name). Required with "
+                             "--register-app; never inferred.")
+    parser.add_argument("--device-type", default="buoy",
+                        help="device_type sent with --register-app (default: buoy).")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip post-flight ChirpStack verification.")
 
     args = parser.parse_args()
+    if args.register_app and not args.org:
+        # ADR-0025 D2: the tool never infers an organization. Filing a
+        # fisher's collar into the wrong org is worse than leaving it out.
+        parser.error("--register-app requires --org <id|name>; the organization is never inferred.")
 
     # Wire region/profile from flags into the same fields the wizard sets
     args.target_region = args.region
@@ -2392,6 +3006,8 @@ def main() -> int:
     try:
         if args.list_mode:
             return asyncio.run(list_mode(args))
+        if args.diagnose_stuck:
+            return asyncio.run(diagnose_stuck(args))
         if args.report:
             return asyncio.run(run_report(args))
         if args.locate:

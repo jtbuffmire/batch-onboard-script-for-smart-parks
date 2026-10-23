@@ -195,6 +195,30 @@ when any non-trivial flag is present.
 | `--no-verify` | Skip the ChirpStack post-flight check (and the pre-flight snapshot). |
 | `--lns-env PATH` | Use credentials from a different `.env` file. |
 
+## App registry (the third registry)
+
+Onboarded means three registries agree (ADR-0025 in app.buoy.fish): the
+device flash, ChirpStack, **and the app's `devices` table**. This tool used to
+check the first two and declare success; the July 2026 six (SP100197–202)
+and four more bench collars were joined and uplinking while invisible to
+every customer.
+
+- **Always on, no credential:** after LNS verification the script asks
+  `GET https://app.buoy.fish/api/devices/lookup/<DevEUI>` for every device it
+  touched (200 registered / 404 not / anything else UNKNOWN — never treated
+  as "not registered"). Joined-but-404 devices get a **JOINED BUT NOT IN
+  APP** section in the report, and `check-onboarded-status.py` shows the
+  same group. A device skipped as "active on ChirpStack" is checked too.
+- **Registration is explicit:** `--register-app --org <id|name>` posts each
+  joined-but-404 device to the app's internal endpoint
+  (`POST /api/internal/devices/register`, shared token
+  `BUOY_MAPPERS_ADMIN_TOKEN` in `./.env`). The organization is **never
+  inferred**; without `--org` the tool refuses. `device_id` is never sent —
+  the app derives it from the EUI so history stored before registration is
+  adopted (the report prints the adopted `last_ping`).
+- **Ledger:** entries gain `app_registered` / `app_registered_at`. The ledger
+  records what this host did; the app decides.
+
 ## Ledger
 
 `onboarded.json` (next to the script, gitignored) is keyed by DevEUI:
@@ -309,14 +333,15 @@ To verify the network state of every device in the ledger without
 doing anything destructive:
 
 ```bash
-source .venv/bin/activate
-python3 check-onboarded-status.py                # full report
-python3 check-onboarded-status.py --only-silent  # devices that never joined
-python3 check-onboarded-status.py --only-joined  # devices that joined
+./check-onboarded-status.sh                  # full report
+./check-onboarded-status.sh --only-silent    # devices that never joined
+./check-onboarded-status.sh --only-joined    # devices that joined
 ```
 
-Reads credentials from `./.env` and queries each device's activation
-endpoint in parallel.
+Same self-bootstrapping wrapper pattern as `batch-onboard.sh`: creates
+`.venv` if needed, installs requirements, then runs the script. Reads
+credentials from `./.env` and queries each device's activation endpoint
+in parallel.
 
 ## Platform notes
 
@@ -334,6 +359,8 @@ endpoint in parallel.
 |---|---|
 | [`batch-onboard.sh`](./batch-onboard.sh) | Bash wrapper: env check, venv, deps, exec the Python script. |
 | [`batch-locate.sh`](./batch-locate.sh) | Wrapper that runs the Python script in `--locate` mode. |
+| [`check-onboarded-status.sh`](./check-onboarded-status.sh) | Wrapper for the read-only ChirpStack status query. |
+| [`_setup-venv.sh`](./_setup-venv.sh) | Sourced helper: shared venv bootstrap used by every wrapper. |
 | [`batch-onboard-us915.py`](./batch-onboard-us915.py) | Wizard, BLE main loop, pre-flight skip, post-flight verification, locate, report. |
 | [`check-onboarded-status.py`](./check-onboarded-status.py) | Standalone activation-based ChirpStack query. |
 | [`requirements.txt`](./requirements.txt) | `bleak`, `questionary`. |
