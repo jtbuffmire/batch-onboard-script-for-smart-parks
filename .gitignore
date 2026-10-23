@@ -18,3 +18,11 @@ reports/
 __pycache__/
 *.pyc
 *.pyo
+
+# Vendor delivery sheets carry LoRaWAN app keys -- never commit
+*.xlsx
+
+# Settings schemas copied from configure.buoy.fish for --report decoding
+settings_v*.json
+settings-v*.json
+settings-meta.json
