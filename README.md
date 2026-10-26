@@ -23,9 +23,10 @@ launches the interactive wizard. The wizard asks:
    mode 0600 so you only do this once.
 2. **Region** — US915, EU868, AS923, AU915, "no change", or an
    "advanced" option that exposes all 13 Semtech modem regions.
-3. **Quick profile** — None, Transit, Daily, Battery Saver, Hourly,
-   Frequent, or Test (mirrors the Quick Profiles in
-   [configure.buoy.fish](https://configure.buoy.fish)).
+3. **Quick profile** — Hourly (the default) or None. Hourly is u-blox GPS
+   every hour with motion-triggered GPS off, the same bytes the app and
+   [configure.buoy.fish](https://configure.buoy.fish) send (ADR-0044 in
+   app.buoy.fish). Night saver is applied from the app over LoRa, not here.
 4. **Force re-visit?** — whether to re-onboard devices that are already
    activated on ChirpStack or already in the local ledger. Default no.
 5. **GPS home (optional)** — decimal `lat,lon` of your deployment area.
@@ -49,7 +50,7 @@ Last batch saved 2026-04-17T00:00:00Z:
                app=28359e48-8409-4900-9eac-e2d5692fa8c2
                key=eyJ0eX...n3dA
   Region:      US915 (3)
-  Profile:     Hourly  -- GPS every hour, motion-triggered.
+  Profile:     Hourly  -- u-blox GPS every hour, around the clock.
   Force:       no (skip already-onboarded)
 
 Reuse these settings? [Y/n]
@@ -160,11 +161,11 @@ when any non-trivial flag is present.
 ./batch-onboard.sh --list
 
 # Target specific SP numbers
-./batch-onboard.sh --sp SP100219 --region US915 --profile transit
+./batch-onboard.sh --sp SP100219 --region US915 --profile hourly
 
 # Single device by direct address (when SP# isn't advertised)
 ./batch-onboard.sh --by-address 22EBCF88-3C86-72DA-DE0B-48BD2443E654 \
-  --region US915 --profile transit --force
+  --region US915 --profile hourly --force
 
 # Skip ChirpStack verification entirely
 ./batch-onboard.sh --sp SP100219 --region US915 --no-verify
@@ -181,7 +182,7 @@ when any non-trivial flag is present.
 | Flag | Purpose |
 |---|---|
 | `--region N` | Semtech region enum (1–13) or name like `US915`. If omitted, the device's current region is preserved. |
-| `--profile id` | One of `transit`, `daily`, `battery_saver`, `hourly`, `frequent`, `test`. |
+| `--profile id` | `hourly` (the only BLE profile, ADR-0044). |
 | `--force` | Bypass BOTH the LNS-active skip and the ledger skip. Re-onboard devices that are already joined or already in the ledger. |
 | `--dry-run` | Connect, read DevEUI + region, but do NOT write or reboot. |
 | `--scan-seconds N` | Length of each BLE scan window (default 10s). Raise for dense deployments. |
@@ -232,7 +233,7 @@ every customer.
       "ble_name": "SP100000",
       "region_before": 1,
       "region_after": 3,
-      "profile_applied": "transit",
+      "profile_applied": "hourly",
       "settings_written": ["lr_gps_interval", "ublox_send_interval", "..."],
       "post_action": "reboot",
       "reset_at": "2026-04-17T00:00:00.000Z",
@@ -376,5 +377,5 @@ MIT — see [LICENSE](./LICENSE).
 ## Source-of-truth references
 
 - BLE protocol & setting IDs: [`prod/configure-buoy-fish/`](../../prod/configure-buoy-fish/)
-- Quick profile definitions: [`prod/configure-buoy-fish/index.html`](../../prod/configure-buoy-fish/index.html) (`UPLINK_PROFILES`)
+- Quick profile contract: ADR-0044 in app.buoy.fish (`docs/adr/0044-gps-profiles.md`), golden vector tested by `test_profiles_golden.py`
 - Region enum & joining gotcha: [`.cursor/rules/irnas-lorawan-regions.mdc`](../../.cursor/rules/irnas-lorawan-regions.mdc)

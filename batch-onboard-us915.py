@@ -32,7 +32,7 @@ Non-interactive flags skip the wizard:
     ./batch-onboard.sh --sp SP100207 SP100208 SP100209
     ./batch-onboard.sh --dry-run --sp SP100280
     ./batch-onboard.sh --by-address 22EBCF88-3C86-72DA-DE0B-48BD2443E654 --force
-    ./batch-onboard.sh --scan-seconds 20 --force --region 3 --profile transit
+    ./batch-onboard.sh --scan-seconds 20 --force --region 3 --profile hourly
 
 Direct `python3 batch-onboard-us915.py ...` will refuse to run unless the
 project venv is active (or BUOY_VENV_BOOTSTRAPPED=1 is exported, e.g. in CI).
@@ -189,30 +189,26 @@ LAST_BATCH_PATH = SCRIPT_DIR / ".last-batch.json"  # remembers wizard answers
 
 
 # ---------------------------------------------------------------------------
-# Quick Profiles (mirror of UPLINK_PROFILES in prod/configure-buoy-fish/index.html)
+# Quick profiles (ADR-0044, app.buoy.fish docs/adr/0044-gps-profiles.md)
 # ---------------------------------------------------------------------------
 #
-# Source of truth: prod/configure-buoy-fish/index.html lines 179-222.
-# Each profile is a sequence of setting writes applied via the same per-setting
-# write frame the web app uses. Setting IDs are pulled from
-# prod/configure-buoy-fish/settings/settings_v7.0.0.json at runtime would be
-# nice, but we hardcode here for offline use; the IDs have been stable across
-# v6.x and v7.x so the risk is low. Cross-check if a new firmware ships.
+# The BLE tools carry Hourly only; Night saver is applied from the app over
+# LoRa. A profile is a byte contract: its writes must equal the ADR's golden
+# vector (test_profiles_golden.py), the same bytes the app's LoRa profile
+# frame and configure.buoy.fish send. Motion-triggered GPS (0x2E) is always
+# written off: the firmware's motion mode skips fixes unless the unit moved,
+# and its motion test compares ms with s.
 #
-# Each profile entry maps a setting NAME (used in logs) to (setting_id, value, length).
-# Length is in bytes; values are encoded little-endian (uint8/uint16/uint32) or
-# bool (1 byte 0/1) by _encode_setting() below.
+# Setting IDs are hardcoded for offline use; they have been stable across
+# v6.x and v7.x. Cross-check if a new firmware ships.
 
 # Setting IDs (hex from settings_v7.0.0.json)
 SID_LR_GPS_INTERVAL          = 0x01
 SID_UBLOX_SEND_INTERVAL      = 0x02
 SID_STATUS_SEND_INTERVAL     = 0x03
 SID_UBLOX_SEND_INTERVAL_2    = 0x26  # 0x25 is gps_backoff_factor (u8) on fw 6.8–7.1
-SID_UBLOX_INTERVAL1_START    = 0x27
-SID_UBLOX_INTERVAL2_START    = 0x52
 SID_UBLOX_MULTIPLE_INTERVALS = 0x29
 SID_ENABLE_MOTION_TRIG_GPS   = 0x2E
-SID_MOTION_THS               = 0x2D
 
 
 def _u32(v: int) -> bytes:
@@ -242,68 +238,23 @@ def int_to_coord(scaled: int) -> float:
 
 
 def _profile_steps(profile: dict) -> list[tuple[str, int, bytes]]:
-    """Return a list of (display_name, setting_id, value_bytes) for a profile."""
-    steps: list[tuple[str, int, bytes]] = [
-        ("lr_gps_interval",      SID_LR_GPS_INTERVAL,       _u32(profile["lr_gps"])),
-        ("ublox_send_interval",  SID_UBLOX_SEND_INTERVAL,   _u32(profile["gps_day"])),
-        ("ublox_send_interval_2", SID_UBLOX_SEND_INTERVAL_2, _u32(profile["gps_night"])),
+    """Return a list of (display_name, setting_id, value_bytes) for a profile.
+    Motion-triggered GPS goes off first, so a visit cut short can't leave it on."""
+    return [
+        ("enable_motion_trig_gps", SID_ENABLE_MOTION_TRIG_GPS, _bool(False)),
+        ("ublox_multiple_intervals", SID_UBLOX_MULTIPLE_INTERVALS, _bool(False)),
+        ("ublox_send_interval",  SID_UBLOX_SEND_INTERVAL,   _u32(profile["gps"])),
+        ("ublox_send_interval_2", SID_UBLOX_SEND_INTERVAL_2, _u32(profile["gps"])),
         ("status_send_interval", SID_STATUS_SEND_INTERVAL,  _u32(profile["status"])),
-        ("ublox_multiple_intervals", SID_UBLOX_MULTIPLE_INTERVALS,
-         _bool(profile["gps_day"] != profile["gps_night"])),
+        ("lr_gps_interval",      SID_LR_GPS_INTERVAL,       _u32(profile["lr_gps"])),
     ]
-    if profile.get("day_start") is not None:
-        steps.append(("ublox_interval1_start", SID_UBLOX_INTERVAL1_START, _u8(profile["day_start"])))
-    if profile.get("night_start") is not None:
-        steps.append(("ublox_interval2_start", SID_UBLOX_INTERVAL2_START, _u8(profile["night_start"])))
-    steps.append(("enable_motion_trig_gps", SID_ENABLE_MOTION_TRIG_GPS,
-                  _bool(profile["motion_trig_gps"])))
-    if profile.get("motion_ths") is not None:
-        steps.append(("motion_ths", SID_MOTION_THS, _u8(profile["motion_ths"])))
-    return steps
 
 
 UPLINK_PROFILES: list[dict] = [
     {
-        "id": "transit", "name": "Transit",
-        "description": "GPS once daily, status 3x daily. Shipping & storage.",
-        "lr_gps": 86400, "gps_day": 86400, "gps_night": 86400, "status": 28800,
-        "day_start": None, "night_start": None, "battery_days": 365,
-        "motion_trig_gps": False, "motion_ths": None,
-    },
-    {
-        "id": "daily", "name": "Daily",
-        "description": "GPS every 12 hours. Minimum usage for basic tracking.",
-        "lr_gps": 43200, "gps_day": 43200, "gps_night": 43200, "status": 43200,
-        "day_start": None, "night_start": None, "battery_days": 365,
-        "motion_trig_gps": False, "motion_ths": None,
-    },
-    {
-        "id": "battery_saver", "name": "Battery Saver",
-        "description": "GPS every 2h day / 4h night. Motion-triggered. Long deployments.",
-        "lr_gps": 7200, "gps_day": 7200, "gps_night": 14400, "status": 3600,
-        "day_start": 4, "night_start": 19, "battery_days": 180,
-        "motion_trig_gps": True, "motion_ths": None,
-    },
-    {
         "id": "hourly", "name": "Hourly",
-        "description": "GPS every hour, motion-triggered.",
-        "lr_gps": 3600, "gps_day": 3600, "gps_night": 3600, "status": 3600,
-        "day_start": None, "night_start": None, "battery_days": 90,
-        "motion_trig_gps": True, "motion_ths": None,
-    },
-    {
-        "id": "frequent", "name": "Frequent",
-        "description": "GPS every 15 min. Active tracking, higher battery use.",
-        "lr_gps": 900, "gps_day": 900, "gps_night": 900, "status": 1800,
-        "day_start": None, "night_start": None, "battery_days": 14,
-        "motion_trig_gps": False, "motion_ths": None,
-    },
-    {
-        "id": "test", "name": "Test",
-        "description": "GPS & status every 15 min. Shake to trigger. Pre-deployment verification.",
-        "lr_gps": 900, "gps_day": 900, "gps_night": 900, "status": 900,
-        "day_start": None, "night_start": None, "battery_days": 14,
-        "motion_trig_gps": True, "motion_ths": 2,
+        "description": "u-blox GPS every hour, around the clock.",
+        "gps": 3600, "status": 3600, "lr_gps": 3600,
     },
 ]
 PROFILES_BY_ID: dict[str, dict] = {p["id"]: p for p in UPLINK_PROFILES}
@@ -1967,7 +1918,7 @@ async def run_by_address(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _profile_label(p: dict) -> str:
-    return f"{p['name']:<14} {p['description']}  (~{p['battery_days']}d battery)"
+    return f"{p['name']:<14} {p['description']}"
 
 
 def _region_label(code: int) -> str:
@@ -2037,7 +1988,7 @@ async def _ask_region_and_profile_and_force(
     ]
     profile_choice = await asyncio.to_thread(
         questionary.select("Apply a quick profile (GPS + status uplink intervals)?",
-                           choices=profile_choices, default=profile_choices[0]).ask
+                           choices=profile_choices, default=profile_choices[1]).ask
     )
     if profile_choice is None:
         return None
