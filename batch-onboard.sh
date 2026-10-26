@@ -9,7 +9,7 @@
 # Usage:
 #   ./batch-onboard.sh                 # interactive wizard
 #   ./batch-onboard.sh --list          # diagnostic, no connects
-#   ./batch-onboard.sh --sp SP100219 --region US915 --profile transit
+#   ./batch-onboard.sh --sp SP100219 --region US915 --profile hourly
 #
 
 set -euo pipefail
